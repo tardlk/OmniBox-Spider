@@ -1,6 +1,7 @@
 // @name 枝枝影视
+// @dependencies: axios
 // @description 页面解析：https://zzoc.cc，支持CF处理、首页、筛选分类、搜索、详情、多线路播放和嗅探兜底；依赖 axios
-// @version 1.1.1
+// @version 1.1.2
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/枝枝影视.js
 
 const OmniBox = require("omnibox_sdk");

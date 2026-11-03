@@ -1,8 +1,8 @@
 // @name Gimy剧迷
 // @author 梦
 // @description 影视站：Gimy / gimy.now / gimyai.tw，支持首页、分类、详情、搜索与播放页嗅探
-// @dependencies cheerio,@types/opencc-js
-// @version 1.2.6
+// @dependencies cheerio,opencc-js
+// @version 1.2.7
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/Gimy剧迷.js
 
 const OmniBox = require("omnibox_sdk");
