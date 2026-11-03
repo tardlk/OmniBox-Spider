@@ -1,6 +1,6 @@
 // @name 4K指南
 // @author 梦
-// @description 网盘资源站：https://4kzn.cc ，支持首页、分类、详情、搜索、网盘播放、刮削、弹幕、播放记录
+// @description 网盘资源站：https://4kzn.cc ，支持首页、分类、详情、搜索、网盘播放、刮削、弹幕
 // @version 1.2.3
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/4K指南.js
 // @dependencies cheerio
@@ -137,18 +137,6 @@ function buildFileNameForDanmu(vodName, episodeTitle) {
   return `${title} ${episode}`;
 }
 
-function buildPlayHistoryPayload({ sourceId, vodId, title, pic, episode, episodeName, episodeNumber }) {
-  if (!sourceId || !vodId) return null;
-  return {
-    vodId,
-    title: title || "",
-    pic: pic || "",
-    episode,
-    sourceId,
-    episodeNumber: typeof episodeNumber === "number" ? episodeNumber : undefined,
-    episodeName: episodeName || "",
-  };
-}
 
 function getBaseURLHost(context = {}) {
   const baseURL = String(context?.baseURL || "").trim();
@@ -742,29 +730,6 @@ async function play(params, context) {
       episodeName = metadataResult.value.episodeName || episodeName;
     } else if (metadataResult.status === "rejected") {
       await OmniBox.log("warn", `[4K指南][play] 获取元数据失败(不影响播放): ${metadataResult.reason && metadataResult.reason.message ? metadataResult.reason.message : metadataResult.reason}`);
-    }
-
-    const historyPayload = buildPlayHistoryPayload({
-      sourceId: context?.sourceId,
-      vodId: String(playMeta.sid || params.vodId || params.videoId || shareURL),
-      title: params.title || scrapeTitle || playMeta.t || shareURL,
-      pic: params.pic || scrapePic || playMeta.p || "",
-      episode: playId,
-      episodeName,
-      episodeNumber,
-    });
-    if (historyPayload) {
-      OmniBox.addPlayHistory(historyPayload)
-        .then((added) => {
-          if (added) {
-            OmniBox.log("info", `[4K指南][play] 已添加观看记录: ${historyPayload.title}`);
-          } else {
-            OmniBox.log("info", `[4K指南][play] 观看记录已存在,跳过添加: ${historyPayload.title}`);
-          }
-        })
-        .catch((error) => {
-          OmniBox.log("warn", `[4K指南][play] 添加观看记录失败: ${error.message}`);
-        });
     }
 
     const header = playInfo.header || {};

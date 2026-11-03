@@ -1,7 +1,7 @@
 // @name 剧迷115
 // @author 梦
-// @description 影视站：gimy115.top，支持首页、分类、搜索、详情与网盘线路提取；支持刮削、弹幕、播放记录；Cookie 支持环境变量配置
-// @version 1.2.1
+// @description 影视站：gimy115.top，支持首页、分类、搜索、详情与网盘线路提取；支持刮削、弹幕；Cookie 支持环境变量配置
+// @version 1.2.2
 // @dependencies cheerio
 
 const OmniBox = require("omnibox_sdk");
@@ -1009,27 +1009,6 @@ async function play(params, context) {
           finalEpisodeName = metadataResult.value.episodeName || finalEpisodeName;
         }
 
-        if (context?.sourceId) {
-          OmniBox.addPlayHistory({
-            vodId: String(playMeta.sid || params.vodId || params.videoId || shareURL),
-            title: params.title || scrapeTitle || playMeta.t || shareURL,
-            pic: params.pic || scrapePic || playMeta.p || "",
-            episode: playId,
-            sourceId: context.sourceId,
-            episodeNumber,
-            episodeName: finalEpisodeName,
-          })
-            .then((added) => {
-              if (added) {
-                OmniBox.log("info", `[Gimy115][play] 已添加观看记录: ${params.title || scrapeTitle || playMeta.t || shareURL}`);
-              } else {
-                OmniBox.log("info", `[Gimy115][play] 观看记录已存在,跳过添加: ${params.title || scrapeTitle || playMeta.t || shareURL}`);
-              }
-            })
-            .catch((error) => {
-              OmniBox.log("warn", `[Gimy115][play] 添加观看记录失败: ${error.message}`);
-            });
-        }
 
         return {
           parse: Number(playInfo?.parse || 0),

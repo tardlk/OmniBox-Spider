@@ -2,7 +2,7 @@
 // @author https://github.com/hjdhnx/drpy-node/blob/main/spider/js/%E4%B8%83%E5%91%B3%5B%E4%BC%98%5D.js
 // @description 刮削：支持，弹幕：支持，嗅探：支持，仅保留七味网盘线路的分组版本
 // @dependencies: axios, cheerio
-// @version 1.6.22
+// @version 1.6.23
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/七味分组.js
 
 const axios = require("axios");
@@ -2307,7 +2307,6 @@ async function buildAndCacheVideoPanDetail(video = {}) {
         panCheckApiConfigured: !!PANCHECK_API,
         scrapeEnabled: typeof OmniBox?.processScraping === "function" && typeof OmniBox?.getScrapeMetadata === "function",
         danmuEnabled: typeof OmniBox?.getDanmakuByFileName === "function" || !!DANMU_API,
-        playHistoryEnabled: typeof OmniBox?.addPlayHistory === "function",
     });
     const allLinks = [];
     for (const links of Object.values(groupedRaw)) {
@@ -2510,38 +2509,6 @@ function findScrapeMapping(metadata = {}, candidates = [], episodeNumber = null,
     return null;
 }
 
-function addPlayHistoryAsync(payload = {}) {
-    if (typeof OmniBox?.addPlayHistory !== "function") return;
-    const sourceId = String(payload.sourceId || "").trim();
-    const vodId = String(payload.vodId || "").trim();
-    const title = String(payload.title || "").trim();
-    if (!sourceId || !vodId || !title) {
-        logWarn("跳过播放记录", { reason: "missing_required_fields", hasSourceId: !!sourceId, vodId, title });
-        return;
-    }
-    try {
-        OmniBox.addPlayHistory({
-            vodId,
-            title,
-            pic: String(payload.pic || "").trim(),
-            episode: String(payload.episode || "").trim(),
-            sourceId,
-            episodeNumber: payload.episodeNumber || null,
-            episodeName: String(payload.episodeName || "").trim(),
-        }).then((added) => {
-            logInfo(added ? "已添加播放记录" : "播放记录已存在，跳过添加", {
-                vodId,
-                title,
-                episodeName: payload.episodeName || "",
-                episodeNumber: payload.episodeNumber || null,
-            });
-        }).catch((error) => {
-            logWarn("添加播放记录失败", { vodId, title, error: error.message || String(error) });
-        });
-    } catch (error) {
-        logWarn("添加播放记录异常", { vodId, title, error: error.message || String(error) });
-    }
-}
 
 async function getMergedMetadataCached(videoId, title, scrapeCandidates = []) {
     const cacheKey = buildCacheKey("qiwei-group:scrape", videoId);
@@ -3730,15 +3697,6 @@ async function resolve115MagnetPlay(playId, flag, callerSource, context, params 
         parse: 0,
         danmaku: finalDanmaku,
     };
-    addPlayHistoryAsync({
-        sourceId: context?.sourceId || "七味分组-115秒传",
-        vodId: String(params.vodId || data.sid || magnet || targetFileId || realFile.fid || playUrl).trim(),
-        title: String(metadataValue?.scrapeTitle || params.vodName || data.v || data.title || data.fileName || targetFile.name || "115秒传资源").trim(),
-        pic: metadataValue?.scrapePic || "",
-        episode: String(metadataValue?.episodeName || data.e || realFile.name || targetFile.name || "").trim(),
-        episodeName: String(metadataValue?.episodeName || data.e || realFile.name || targetFile.name || "").trim(),
-        episodeNumber: metadataValue?.episodeNumber || data.n || null,
-    });
     logInfo("115磁力文件播放地址返回", {
         fid: realFile.fid || "",
         pickcode: realFile.pickcode || "",
@@ -3799,14 +3757,6 @@ async function play(params, context = {}) {
     if (playId.startsWith("magnet:")) {
         const pushed = await pushMagnetTo115(playId);
         const displayName = pushed?.ok ? "磁力资源（已提交115）" : "磁力资源";
-        addPlayHistoryAsync({
-            sourceId: context?.sourceId || "七味分组-磁力",
-            vodId: String(params.vodId || playMeta.sid || playId).trim(),
-            title: String(params.vodName || playMeta.v || playMeta.e || displayName).trim(),
-            episode: String(params.episodeName || playMeta.e || displayName).trim(),
-            episodeName: String(params.episodeName || playMeta.e || displayName).trim(),
-            episodeNumber: playMeta.n || null,
-        });
         return {
             urls: [{ name: displayName, url: playId }],
             parse: 0,
@@ -3911,15 +3861,6 @@ async function play(params, context = {}) {
                     const metadataValue = metadataResult.status === "fulfilled" ? metadataResult.value : null;
                     const finalDanmaku = metadataValue?.danmakuList?.length ? metadataValue.danmakuList : (playInfo?.danmaku || []);
 
-                    addPlayHistoryAsync({
-                        sourceId: context?.sourceId || `七味分组-${parsePanType(shareURL) || "网盘"}`,
-                        vodId: String(params.vodId || playMeta.sid || shareURL).trim(),
-                        title: String(metadataValue?.scrapeTitle || params.vodName || playMeta.v || playMeta.e || "网盘资源").trim(),
-                        pic: metadataValue?.scrapePic || "",
-                        episode: String(metadataValue?.episodeName || params.episodeName || playMeta.e || fileId).trim(),
-                        episodeName: String(metadataValue?.episodeName || params.episodeName || playMeta.e || fileId).trim(),
-                        episodeNumber: metadataValue?.episodeNumber || playMeta.n || null,
-                    });
                     return {
                         urls: urlsResult,
                         header,
@@ -4026,15 +3967,6 @@ async function play(params, context = {}) {
                 }
             }
 
-            addPlayHistoryAsync({
-                sourceId: context?.sourceId || `七味分组-${flag || "采集"}`,
-                vodId: String(params.vodId || playMeta.sid || playId).trim(),
-                title: String(vodName || params.vodName || playMeta.v || playMeta.e || "七味资源").trim(),
-                pic: "",
-                episode: String(episodeName || params.episodeName || playMeta.e || "").trim(),
-                episodeName: String(episodeName || params.episodeName || playMeta.e || "").trim(),
-                episodeNumber: playMeta.n || null,
-            });
             return {
                 urls: [{ name: "嗅探线路", url: sniffed.url }],
                 parse: 0,

@@ -2,7 +2,7 @@
 // @author @Tao_XG
 // @description 聚合玩偶、木偶、蜡笔、闪电、至臻、二小、虎斑、快映、欧哥、多多、蜗牛4K等网盘站点；支持刮削、弹幕、多线路、二级分类筛选、翻页、网盘排序
 // @dependencies axios,cheerio
-// @version 1.0.0
+// @version 1.0.1
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/玩偶聚合-非分组.js
 
 const OmniBox = require("omnibox_sdk");
@@ -2245,25 +2245,6 @@ async function play(params, context) {
           const title = params.title || scrapeTitle || shareURL;
           const pic = params.pic || scrapePic || "";
 
-          OmniBox.addPlayHistory({
-            vodId: scrapeKey,
-            title: title,
-            pic: pic,
-            episode: playId,
-            sourceId: sourceId,
-            episodeNumber: episodeNumber,
-            episodeName: episodeName,
-          })
-            .then((added) => {
-              if (added) {
-                OmniBox.log("info", `[play] 已添加观看记录: ${title}`);
-              } else {
-                OmniBox.log("info", `[play] 观看记录已存在,跳过添加: ${title}`);
-              }
-            })
-            .catch((error) => {
-              OmniBox.log("warn", `[play] 添加观看记录失败: ${error.message}`);
-            });
         }
       }
     } catch (error) {

@@ -1,7 +1,7 @@
 // @name 影视库
 // @author lampon
 // @description 
-// @version 1.0.1
+// @version 1.0.2
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/影视库/影视库.js
 
 
@@ -493,29 +493,6 @@ async function play(params, context) {
             /* ignore */
         }
 
-        try {
-            if (context && context.sourceId && libraryVodId) {
-                let totalDuration = null;
-                try {
-                    const info = await OmniBox.getVideoMediaInfo(urlOnly, header);
-                    const dur = info && info.format && info.format.duration;
-                    if (typeof dur === "number" && Number.isFinite(dur) && dur > 0) totalDuration = dur;
-                } catch (_) {
-                    /* ignore */
-                }
-                await OmniBox.addPlayHistory({
-                    vodId: libraryVodId,
-                    title: (item && item.title) || params.title || urlOnly,
-                    pic: (item && item.coverUrl) || params.pic || "",
-                    episode: urlOnly,
-                    episodeName: params.episodeName || "",
-                    totalDuration: totalDuration != null ? totalDuration : undefined,
-                });
-            }
-        } catch (e) {
-            await OmniBox.log("warn", `[media_library_cloud] addPlayHistory: ${e.message}`);
-        }
-
         return { urls: [{ name: "播放", url: urlOnly }], header, parse: 0, danmaku: Array.isArray(danmaku) ? danmaku : [] };
     }
     else {
@@ -550,29 +527,6 @@ async function play(params, context) {
                     }
                 } catch (_) {
                     /* ignore */
-                }
-
-                try {
-                    if (context && context.sourceId && libraryVodId) {
-                        let totalDuration = null;
-                        try {
-                            const info = await OmniBox.getVideoMediaInfo(urlsResult[0].url, header);
-                            const dur = info && info.format && info.format.duration;
-                            if (typeof dur === "number" && Number.isFinite(dur) && dur > 0) totalDuration = dur;
-                        } catch (_) {
-                            /* ignore */
-                        }
-                        await OmniBox.addPlayHistory({
-                            vodId: libraryVodId,
-                            title: (item && item.title) || params.title || shareURL,
-                            pic: (item && item.coverUrl) || params.pic || "",
-                            episode: `${fid}|${shareURL}`,
-                            episodeName: params.episodeName || "",
-                            totalDuration: totalDuration != null ? totalDuration : undefined,
-                        });
-                    }
-                } catch (e) {
-                    await OmniBox.log("warn", `[media_library_cloud] addPlayHistory: ${e.message}`);
                 }
 
                 return { urls: urlsResult, header, parse: 0, danmaku: danmakuList };

@@ -1,8 +1,8 @@
 // @name 茶杯狐
 // @author 梦
-// @description 影视站：支持首页、分类、详情、刮削、弹幕、播放记录与播放；搜索受站点人机验证影响，失败时安全降级
+// @description 影视站：支持首页、分类、详情、刮削、弹幕与播放；搜索受站点人机验证影响，失败时安全降级
 // @dependencies cheerio
-// @version 1.1.1
+// @version 1.1.2
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/茶杯狐.js
 
 const OmniBox = require("omnibox_sdk");
@@ -335,15 +335,6 @@ function buildScrapedEpisodeName(scrapeData, mapping, originalName) {
   return originalName;
 }
 
-function buildHistoryEpisode(playId, episodeNumber, episodeName) {
-  if (episodeNumber !== undefined && episodeNumber !== null && episodeNumber !== "") {
-    return `${playId || ""}@@${episodeNumber}`;
-  }
-  if (episodeName) {
-    return `${playId || ""}@@${episodeName}`;
-  }
-  return playId || "";
-}
 
 function base64Decode(str) {
   const safe = String(str || "").replace(/[\r\n\s]/g, "");
@@ -952,31 +943,6 @@ async function play(params = {}, context = {}) {
       await OmniBox.log("info", `[茶杯狐][play] 播放增强链路失败(不影响播放): ${metadataResult.reason?.message || metadataResult.reason}`);
     }
 
-    if (playMeta?.fid && context?.sourceId && typeof OmniBox.addPlayHistory === "function") {
-      const videoIdForScrape = buildScrapeResourceId(playMeta.sid || playMeta.fid.split("#")[0] || "");
-      const historyPayload = {
-        vodId: videoIdForScrape,
-        title: scrapeTitle || vodName || playMeta.v || "茶杯狐视频",
-        pic: scrapePic || "",
-        episode: buildHistoryEpisode(playId, episodeNumber, episodeName),
-        sourceId: context.sourceId,
-        episodeNumber,
-        episodeName: episodeName || "",
-      };
-      OmniBox.addPlayHistory(historyPayload)
-        .then((added) => {
-          if (added) {
-            OmniBox.log("info", `[茶杯狐][play] 已添加播放记录: ${historyPayload.title}`);
-          } else {
-            OmniBox.log("info", `[茶杯狐][play] 播放记录已存在，跳过添加: ${historyPayload.title}`);
-          }
-        })
-        .catch((error) => {
-          OmniBox.log("info", `[茶杯狐][play] 添加播放记录失败: ${error.message}`);
-        });
-    } else {
-      await OmniBox.log("info", `[茶杯狐][play] 跳过播放记录 sourceId=${context?.sourceId || ""} fid=${playMeta?.fid || ""} hasApi=${typeof OmniBox.addPlayHistory === "function"}`);
-    }
 
     if (danmakuList.length > 0) {
       playResult.danmaku = danmakuList;

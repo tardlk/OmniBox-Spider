@@ -2,7 +2,7 @@
 # @name 拦截器模板
 # @author OmniBox
 # @description 通用拦截器模板，覆盖所有生命周期阶段（home/category/search/detail/play 的 before 与 after），含完整注释和日志示例
-# @version 1.0.0
+# @version 1.0.1
 # @filter-stages home_before,home_after,category_before,category_after,search_before,search_after,detail_before,detail_after,play_before,play_after
 # @filter-config-schema {"description":"通用拦截器模板，演示如何在各个生命周期阶段拦截并处理数据","fields":[{"key":"enabled","label":"启用拦截器","type":"boolean","required":false,"placeholder":"全局开关，默认启用"},{"key":"logLevel","label":"日志级别","type":"select","required":false,"placeholder":"日志输出级别","options":[{"label":"debug","value":"debug"},{"label":"info","value":"info"},{"label":"warn","value":"warn"},{"label":"error","value":"error"}]},{"key":"customParam","label":"自定义参数","type":"string","required":false,"placeholder":"可在拦截器中使用的自定义配置项"}]}
 
@@ -69,13 +69,10 @@ OmniBox 拦截器模板 (Python)
   OmniBox.request(url, options)           - 发送 HTTP 请求
   OmniBox.getScrapeMetadata(video_id)     - 获取 TMDB 刮削元数据
   OmniBox.processScraping(video_id, ...)  - 触发 TMDB 刮削
-  OmniBox.addPlayHistory(record)          - 添加播放历史记录
-  OmniBox.updateFavoriteEpisode(...)      - 更新追剧集数
   OmniBox.getDanmakuByFileName(file_name) - 根据文件名匹配弹幕
   OmniBox.getDriveInfoByShareURL(url)     - 获取网盘信息
   OmniBox.getDriveFileList(url, fid)      - 获取网盘文件列表
   OmniBox.getDriveVideoPlayInfo(...)      - 获取网盘视频播放信息
-  OmniBox.getAnalyzeSites()              - 获取已配置的站点列表
   OmniBox.getCache(key)                  - 获取缓存
   OmniBox.setCache(key, value, ttl)      - 设置缓存
 
@@ -575,26 +572,10 @@ async def after_play(params: dict) -> dict:
     #     except Exception as error:
     #         await log("warn", f"弹幕匹配失败 {error}", extend)
 
-    # === 播放记录示例（参考 播放记录拦截器.js）===
+    # === 播放记录说明 ===
     #
-    # vod_id = safe_str(request_params.get("vodId"))
-    # if vod_id:
-    #     try:
-    #         title = safe_str(data.get("vod_name") or data.get("title") or vod_id)
-    #         pic = safe_str(data.get("vod_pic") or data.get("pic"))
-    #         context = params.get("context") or {}
-    #         added = await OmniBox.addPlayHistory({
-    #             "vodId": vod_id,
-    #             "title": title,
-    #             "pic": pic,
-    #             "episode": safe_str(request_params.get("playId")),
-    #             "sourceId": safe_str(context.get("sourceId")),
-    #             "episodeNumber": data.get("episodeNumber"),
-    #             "episodeName": safe_str(data.get("episodeName")),
-    #         })
-    #         await log("info", f"{'已添加' if added else '已存在跳过'} title={title}", extend)
-    #     except Exception as error:
-    #         await log("warn", f"记录失败 {error}", extend)
+    # 新版 SDK 已移除 addPlayHistory：播放记录由宿主根据 play() 的返回值自动写入，
+    # 这里不要再手动记录，也不要再调用 updateFavoriteEpisode（该接口不存在）。
 
     # === 自定义参数使用示例 ===
     #

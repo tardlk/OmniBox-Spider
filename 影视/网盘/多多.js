@@ -1,8 +1,8 @@
 // @name 多多
 // @author
-// @description 刮削：支持，弹幕：支持，播放记录：支持
+// @description 刮削：支持，弹幕：支持，播放记录：宿主自动
 // @dependencies: axios, cheerio
-// @version 1.0.2
+// @version 1.0.3
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/多多.js
 
 // 引入 OmniBox SDK
@@ -1135,15 +1135,6 @@ async function play(params) {
         const title = params.title || scrapeTitle || shareURL;
         const pic = params.pic || scrapePic || "";
 
-        const added = await OmniBox.addPlayHistory({
-          vodId: vodId,
-          title: title,
-          pic: pic,
-          episode: playId,
-          sourceId: shareURL,
-          episodeNumber: episodeNumber,
-          episodeName: episodeName,
-        });
 
         if (added) {
           OmniBox.log("info", `已添加观看记录: ${title}`);

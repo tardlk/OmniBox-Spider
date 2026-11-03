@@ -2,7 +2,7 @@
 // @author lampon
 // @description
 // @dependencies axios
-// @version 1.1.16
+// @version 1.1.17
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/影巢.js
 
 const OmniBox = require("omnibox_sdk");
@@ -108,15 +108,11 @@ async function getTMDBAuth() {
   // 返回 { mode: "query"|"bearer", value: string }
   if (tmdbAuthCache) return tmdbAuthCache;
 
-  // OmniBox 脚本环境变量优先走 getEnv（后台“环境变量”表里配置）
+  // 新版 SDK 已移除 getEnv；环境变量由执行器在启动子进程时注入 process.env
   const fetchEnvCandidates = async (names) => {
     for (const name of names) {
-      try {
-        const v = await OmniBox.getEnv(name);
-        if (v) return v;
-      } catch {
-        // ignore
-      }
+      const v = process.env[name];
+      if (v) return String(v).trim();
     }
     return "";
   };
@@ -2598,28 +2594,6 @@ async function play(params, context) {
       const title = safeString(params?.title || scrapeTitle || shareURL);
       const pic = safeString(params?.pic || scrapePic || "");
       const firstUrl = urls[0]?.url || "";
-      Promise.resolve(OmniBox.addPlayHistory({
-        vodId,
-        title,
-        pic,
-        episode: playId,
-        episodeNumber: episodeNumber,
-        episodeName: episodeName,
-        playUrl: firstUrl,
-        playHeader: playInfo.header || {},
-      }))
-        .then((added) => {
-          OmniBox.log(
-            "info",
-            `tmdb.js play 写入播放记录完成: vodId=${vodId}, episodeName=${episodeName || ""}, added=${String(added)}`,
-          );
-        })
-        .catch((error) => {
-          OmniBox.log(
-            "warn",
-            `tmdb.js play 写入播放记录失败: ${error.message}`,
-          );
-        });
     } catch (error) {
       await OmniBox.log(
         "warn",

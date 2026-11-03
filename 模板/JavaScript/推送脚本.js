@@ -2,7 +2,7 @@
 // @push 1
 // @author lampon
 // @description 推送脚本
-// @version 1.0.6
+// @version 1.0.7
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/模板/JavaScript/推送脚本.js
 
 const OmniBox = require("omnibox_sdk");
@@ -546,15 +546,6 @@ async function play(params) {
         // 优先使用params中的封面图，其次使用刮削的封面图
         const pic = params.pic || scrapePic || "";
 
-        const added = await OmniBox.addPlayHistory({
-          vodId: vodId,
-          title: title,
-          pic: pic,
-          episode: playId, // 使用playId作为剧集标识
-          sourceId: shareURL,
-          episodeNumber: episodeNumber,
-          episodeName: episodeName,
-        });
 
         if (added) {
           OmniBox.log("info", `已添加观看记录: ${title}`);

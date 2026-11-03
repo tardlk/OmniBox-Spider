@@ -1,7 +1,7 @@
 // @name 拦截器模板
 // @author OmniBox
 // @description 通用拦截器模板，覆盖所有生命周期阶段（home/category/search/detail/play 的 before 与 after），含完整注释和日志示例
-// @version 1.0.0
+// @version 1.0.1
 // @filter-stages home_before,home_after,category_before,category_after,search_before,search_after,detail_before,detail_after,play_before,play_after
 // @filter-config-schema {"description":"通用拦截器模板，演示如何在各个生命周期阶段拦截并处理数据","fields":[{"key":"enabled","label":"启用拦截器","type":"boolean","required":false,"placeholder":"全局开关，默认启用"},{"key":"logLevel","label":"日志级别","type":"select","required":false,"placeholder":"日志输出级别","options":[{"label":"debug","value":"debug"},{"label":"info","value":"info"},{"label":"warn","value":"warn"},{"label":"error","value":"error"}]},{"key":"customParam","label":"自定义参数","type":"string","required":false,"placeholder":"可在拦截器中使用的自定义配置项"}]}
 
@@ -68,13 +68,12 @@
  *   OmniBox.request(url, options)           - 发送 HTTP 请求
  *   OmniBox.getScrapeMetadata(videoId)      - 获取 TMDB 刮削元数据
  *   OmniBox.processScraping(videoId, ...)   - 触发 TMDB 刮削
- *   OmniBox.addPlayHistory(record)          - 添加播放历史记录
- *   OmniBox.updateFavoriteEpisode(...)      - 更新追剧集数
  *   OmniBox.getDanmakuByFileName(fileName)  - 根据文件名匹配弹幕
  *   OmniBox.getDriveInfoByShareURL(url)     - 获取网盘信息
  *   OmniBox.getDriveFileList(url, fid)      - 获取网盘文件列表
  *   OmniBox.getDriveVideoPlayInfo(...)      - 获取网盘视频播放信息
- *   OmniBox.getAnalyzeSites()              - 获取已配置的站点列表
+ *   OmniBox.getVideoMediaInfo(url, headers) - 探测媒体信息（ffprobe）
+ *   OmniBox.getCache / setCache / deleteCache - 跨请求缓存
  *
  * 【日志规范】
  *   - debug : 详细的调试信息，如参数解析过程、中间变量值
@@ -529,27 +528,10 @@ async function afterPlay(params) {
   //   }
   // }
 
-  // === 播放记录示例（参考 播放记录拦截器.js）===
+  // === 播放记录说明 ===
   //
-  // const vodId = String(requestParams.vodId || "");
-  // if (vodId) {
-  //   try {
-  //     const title = String(data.vod_name || data.title || vodId);
-  //     const pic = String(data.vod_pic || data.pic || "");
-  //     const added = await OmniBox.addPlayHistory({
-  //       vodId: vodId,
-  //       title: title,
-  //       pic: pic,
-  //       episode: requestParams.playId || "",
-  //       sourceId: String(params?.context?.sourceId || ""),
-  //       episodeNumber: data.episodeNumber,
-  //       episodeName: String(data.episodeName || ""),
-  //     });
-  //     await log("info", `${added ? "已添加" : "已存在跳过"} title=${title}`, extend);
-  //   } catch (error) {
-  //     await log("warn", `记录失败 ${error.message}`, extend);
-  //   }
-  // }
+  // 新版 SDK 已移除 addPlayHistory：播放记录由宿主根据 play() 的返回值自动写入，
+  // 拦截器里不要再手动记录，也不要再调用 updateFavoriteEpisode（该接口不存在）。
 
   // === 自定义参数使用示例 ===
   //

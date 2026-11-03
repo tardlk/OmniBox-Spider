@@ -1,7 +1,7 @@
 // @name 盘搜
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持，网盘：115、夸克、UC、百度、天翼、移动、阿里、迅雷、123，来源：web、tvbox、uz、emby、catvod
-// @version 1.3.10
+// @version 1.3.11
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/盘搜.js
 /**
  * OmniBox 网盘爬虫脚本
@@ -1777,28 +1777,9 @@ async function play(params, context) {
     // 线路解析: 默认 web/emby 走服务端代理，其它直连；若 flag 含前缀，取最后一段
     const routeType = resolveRouteType(flag, source, context);
 
-    // 并行: 主链路(播放地址) + 辅链路(观看记录参数整理，不阻塞主链)
+    // 主链路(播放地址)
     const playInfoPromise = OmniBox.getDriveVideoPlayInfo(shareURL, fileId, routeType);
     OmniBox.log("info", `使用线路: ${routeType}`);
-
-    const historyPayload = (() => {
-      try {
-        const sourceId = context.sourceId;
-        if (!sourceId) return null;
-        return {
-          vodId: params.vodId || shareURL,
-          title: params.title || scrapeTitle || shareURL,
-          pic: params.pic || scrapePic || "",
-          episode: playId,
-          sourceId,
-          episodeNumber,
-          episodeName,
-        };
-      } catch (error) {
-        OmniBox.log("warn", `整理观看记录参数失败: ${error.message}`);
-        return null;
-      }
-    })();
 
     const playInfo = await playInfoPromise;
 
@@ -1806,19 +1787,6 @@ async function play(params, context) {
       throw new Error("无法获取播放地址");
     }
 
-    if (historyPayload) {
-      OmniBox.addPlayHistory(historyPayload)
-        .then((added) => {
-          if (added) {
-            OmniBox.log("info", `已添加观看记录: ${historyPayload.title}`);
-          } else {
-            OmniBox.log("info", `观看记录已存在，跳过添加: ${historyPayload.title}`);
-          }
-        })
-        .catch((error) => {
-          OmniBox.log("warn", `添加观看记录失败: ${error.message}`);
-        });
-    }
 
     // 使用后端返回的url数组（格式：[{name: "RAW", url: "..."}, ...]）
     // 对于夸克和UC网盘，如果flag是"服务端代理"或"本地代理"，URL已经包含前缀

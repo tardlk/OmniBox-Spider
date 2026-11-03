@@ -1,8 +1,8 @@
 // @name 枫叶4K
 // @author 梦
-// @description 影视站：支持首页、分类（VIP精选/类型筛选）、详情、搜索与播放，补齐刮削、弹幕与播放记录，基于 https://www.cd-zj.com
+// @description 影视站：支持首页、分类（VIP精选/类型筛选）、详情、搜索与播放，补齐刮削与弹幕，基于 https://www.cd-zj.com
 // @dependencies cheerio
-// @version 1.0.0
+// @version 1.0.1
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶4K.js
 
 const OmniBox = require("omnibox_sdk");
@@ -137,13 +137,6 @@ function buildScrapedDanmuFileName(scrapeData, scrapeType, mapping, fallbackVodN
   return `${title}.${seasonAirYear}.S${String(seasonNumber).padStart(2, "0")}E${String(episodeNumber).padStart(2, "0")}`;
 }
 
-function buildHistoryEpisode(playId, episodeNumber, episodeName) {
-  if (episodeNumber !== undefined && episodeNumber !== null && episodeNumber !== "") {
-    if (episodeName) return `第${episodeNumber}集 ${episodeName}`;
-    return `第${episodeNumber}集`;
-  }
-  return episodeName || playId || "播放";
-}
 
 module.exports = { home, category, detail, search, play };
 runner.run(module.exports);
@@ -870,28 +863,6 @@ async function play(params = {}, context = {}) {
     playResult.danmaku = danmakuList.length > 0 ? danmakuList : (playResult.danmaku || []);
 
     const videoIdForScrape = String(playMeta?.sid || params.videoId || params.vod_id || "");
-    if (videoIdForScrape && context?.sourceId && typeof OmniBox.addPlayHistory === "function") {
-      const historyPayload = {
-        vodId: videoIdForScrape,
-        title: scrapeTitle || vodName || playMeta.v || "枫叶4K视频",
-        pic: scrapePic || "",
-        episode: buildHistoryEpisode(playId, episodeNumber, episodeName),
-        sourceId: context.sourceId,
-        episodeNumber,
-        episodeName: episodeName || "",
-      };
-      OmniBox.addPlayHistory(historyPayload)
-        .then((added) => {
-          if (added) {
-            OmniBox.log("info", `[枫叶4K][play] 已添加播放记录: ${historyPayload.title}`);
-          } else {
-            OmniBox.log("info", `[枫叶4K][play] 播放记录已存在，跳过添加: ${historyPayload.title}`);
-          }
-        })
-        .catch((error) => {
-          OmniBox.log("warn", `[枫叶4K][play] 添加播放记录失败: ${error.message}`);
-        });
-    }
 
     return playResult;
   } catch (e) {
