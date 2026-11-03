@@ -1,8 +1,8 @@
 // @name 4KMP
 // @author 梦
-// @description 4k-av.com：支持首页、分类、搜索、详情与直链播放，站点请求使用苹果 Safari UA
+// @description 4k-av.com：支持首页、分类、搜索、详情与直链播放，站点请求使用苹果 Safari UA；封面可用 KMP_IMG_PROXY=server/wsrv 加速
 // @dependencies cheerio
-// @version 1.0.2
+// @version 1.0.3
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4KMP.js
 
 const OmniBox = require("omnibox_sdk");
@@ -93,6 +93,30 @@ function absUrl(url) {
   return `${BASE_URL}/${value.replace(/^\.\//, "")}`;
 }
 
+// ==================== 封面加速（可选）====================
+// KMP_IMG_PROXY:
+//   0 / off / direct（默认）：直接用站点的图片直链，行为不变
+//   server：走 OmniBox 图片代理 /api/proxy/image（服务端拉一次 + 浏览器缓存一年，可绕防盗链）
+//   wsrv：走 wsrv.nl 压缩成 webp 并限宽（体积通常降到 1/10，取决于该服务在你网络的可达性）
+const IMG_MODE = String(process.env.KMP_IMG_PROXY || "0").trim().toLowerCase();
+const IMG_WIDTH = Number(process.env.KMP_IMG_WIDTH || 320) || 320;
+
+function wrapImage(url, context) {
+  const u = String(url || "").trim();
+  if (!u || !/^https?:\/\//i.test(u)) return u;
+  if (!IMG_MODE || IMG_MODE === "0" || IMG_MODE === "off" || IMG_MODE === "direct") return u;
+
+  if (IMG_MODE === "wsrv") {
+    return `https://wsrv.nl/?url=${encodeURIComponent(u)}&w=${IMG_WIDTH}&output=webp&q=75&we`;
+  }
+
+  // server：拼 OmniBox 图片代理，附带 Referer 以通过防盗链
+  const base = String((context && context.baseURL) || "").replace(/\/+$/, "");
+  if (!base) return u;
+  const target = `${u}@Referer=${encodeURIComponent(`${BASE_URL}/`)}`;
+  return `${base}/api/proxy/image?url=${encodeURIComponent(target)}`;
+}
+
 function buildHeaders(referer = `${BASE_URL}/`, extra = {}) {
   return {
     "User-Agent": UA,
@@ -163,7 +187,7 @@ function pickLabels($, $box) {
   return map;
 }
 
-function mapVodCard($, el) {
+function mapVodCard($, el, context) {
   const $box = $(el);
   const $titleLink = $box.find(".title a[href*='/movie/'], .title a[href*='/tv/'], a[href*='/movie/'], a[href*='/tv/']").first();
   const href = $titleLink.attr("href") || "";
@@ -190,7 +214,7 @@ function mapVodCard($, el) {
   return {
     vod_id: absUrl(href),
     vod_name: name,
-    vod_pic: pic,
+    vod_pic: wrapImage(pic, context),
     vod_url: absUrl(href),
     vod_remarks: labels["分辨率"] || "",
     vod_year: labels["年份"] || "",
@@ -201,17 +225,17 @@ function mapVodCard($, el) {
   };
 }
 
-function parseVodList(html, selector = "#MainContent_newestlist .NTMitem") {
+function parseVodList(html, selector = "#MainContent_newestlist .NTMitem", context = null) {
   const $ = cheerio.load(html || "", { decodeEntities: false });
   const list = [];
   $(selector).each((_, el) => {
-    const item = mapVodCard($, el);
+    const item = mapVodCard($, el, context);
     if (item) list.push(item);
   });
 
   if (!list.length) {
     $("#recommlist .RTMitem").each((_, el) => {
-      const item = mapVodCard($, el);
+      const item = mapVodCard($, el, context);
       if (item) list.push(item);
     });
   }
@@ -284,7 +308,7 @@ function parseMediaSources($, pageUrl) {
   return dedupeById(list);
 }
 
-function extractDetailInfo(html, pageUrl) {
+function extractDetailInfo(html, pageUrl, context = null) {
   const $ = cheerio.load(html || "", { decodeEntities: false });
   const labels = pickLabels($, $.root());
   const vodName = cleanText(
@@ -356,7 +380,7 @@ function extractDetailInfo(html, pageUrl) {
   return {
     vod_id: pageUrl,
     vod_name: vodName,
-    vod_pic: vodPic,
+    vod_pic: wrapImage(vodPic, context),
     vod_content: vodContent,
     vod_subtitle: vodSubtitle,
     vod_year: labels["年份"] || "",
@@ -416,7 +440,7 @@ function looksLikeMedia(url) {
 async function home(params, context) {
   try {
     const html = await fetchText(`${BASE_URL}/`);
-    const list = parseVodList(html).slice(0, 36);
+    const list = parseVodList(html, undefined, context).slice(0, 36);
     await OmniBox.log("info", `[4KMP][home] list=${list.length}`);
     return {
       class: CLASS_LIST.map((item) => ({ ...item })),
@@ -439,7 +463,7 @@ async function category(params, context) {
     const pageCount = parsePageCount(firstHtml);
     const sourcePage = Math.max(1, pageCount - page + 1);
     const html = page <= 1 ? firstHtml : await fetchText(buildPagedPath(basePath, sourcePage, pageCount), { referer: absUrl(basePath) });
-    const list = parseVodList(html);
+    const list = parseVodList(html, undefined, context);
     await OmniBox.log("info", `[4KMP][category] type=${typeId} page=${page} sourcePage=${sourcePage} list=${list.length}`);
     return {
       page,
@@ -459,7 +483,7 @@ async function detail(params, context) {
     if (!vodId) return { list: [] };
     const pageUrl = absUrl(vodId);
     const html = await fetchText(pageUrl);
-    const info = extractDetailInfo(html, pageUrl);
+    const info = extractDetailInfo(html, pageUrl, context);
     await OmniBox.log("info", `[4KMP][detail] ${info.vod_name} episodes=${info.vod_play_sources?.[0]?.episodes?.length || 0}`);
     return { list: [info] };
   } catch (error) {
@@ -475,7 +499,7 @@ async function search(params, context) {
     if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
     const url = `${BASE_URL}/s?y=${encodeURIComponent(keyword)}`;
     const html = await fetchText(url);
-    const list = refineSearchResults(parseVodList(html), keyword);
+    const list = refineSearchResults(parseVodList(html, undefined, context), keyword);
     await OmniBox.log("info", `[4KMP][search] keyword=${keyword} list=${list.length}`);
     return {
       page,
