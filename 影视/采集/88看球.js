@@ -1,6 +1,6 @@
 // @name 88看球
 // @dependencies: axios, cheerio, crypto-js
-// @version 1.1.1
+// @version 1.2.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/88看球.js
 /**
  * 刮削：不支持
@@ -11,7 +11,8 @@
  * 1. 本脚本由 `本地调试/88看球.js` 转换为 OmniBox 标准模板结构。
  * 2. 接口包含：`home` / `category` / `search` / `detail` / `play`。
  * 3. 详情接口将旧式 `vod_play_from + vod_play_url` 转换为 `vod_play_sources`。
- * 4. `playId` 使用 Base64(JSON) 透传；play 阶段优先抽出内层 m3u8 返回 `parse=0` 直链，
+ * 4. `playId` 只存 `{g:比赛ID,i:线路序号,n:线路名}` 的 base64url（约 47 字符）；
+ *    play 阶段再拉一次 source 取最新签名地址，并抽出内层 m3u8 返回 `parse=0` 直链，
  *    仅在确实解不出时才回退 `parse=1`（该模式只有 ok影视 会做客户端嗅探）。
  *
  * 变更记录：
@@ -58,7 +59,12 @@ function logError(message, error) {
 // ==================== 编解码工具 ====================
 function e64(text) {
   try {
-    return CryptoJS.enc.Utf8.parse(String(text || "")).toString(CryptoJS.enc.Base64);
+    // 用 base64url：去掉 + / =，避免 playId 在 URL / 路由里被截断或转义
+    return CryptoJS.enc.Utf8.parse(String(text || ""))
+      .toString(CryptoJS.enc.Base64)
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
   } catch {
     return "";
   }
@@ -66,7 +72,10 @@ function e64(text) {
 
 function d64(encodedText) {
   try {
-    return CryptoJS.enc.Base64.parse(String(encodedText || "")).toString(CryptoJS.enc.Utf8);
+    let s = String(encodedText || "").trim().replace(/-/g, "+").replace(/_/g, "/");
+    if (!s) return "";
+    s += "=".repeat((4 - (s.length % 4)) % 4);
+    return CryptoJS.enc.Base64.parse(s).toString(CryptoJS.enc.Utf8);
   } catch {
     return "";
   }
@@ -276,6 +285,34 @@ async function getCategoryList(type, extend = {}) {
 }
 
 /**
+ * 拉取某场比赛的全部线路（source 接口）
+ * @param {string} gid 比赛 ID
+ * @returns {Promise<Array<{url: string, name: string}>>}
+ */
+async function fetchSourceLinks(gid) {
+  const id = String(gid || "").trim();
+  if (!id) return [];
+  try {
+    const response = await axiosInstance.get(`${HOST}/live/${id}/source`, {
+      headers: {
+        ...DEFAULT_HEADERS,
+        Referer: `${HOST}/live/${id}/play`,
+      },
+    });
+    const links = parseLinksFromPlayApiResponse(response?.data) || [];
+    return links
+      .filter((it) => it?.url)
+      .map((it) => ({
+        url: String(it.url || "").replace(/\*\*\*/g, "#"),
+        name: String(it.name || ""),
+      }));
+  } catch (error) {
+    logError("拉取线路失败", error);
+    return [];
+  }
+}
+
+/**
  * 拉取详情并转换播放源
  * @param {string} rawId 列表中的 vod_id
  * @returns {Promise<Object|null>}
@@ -307,16 +344,12 @@ async function getDetailById(rawId) {
           const episodes = links
             .filter((it) => it?.url)
             .map((it, index) => {
-              const playData = {
-                url: String(it.url || "").replace(/\*\*\*/g, "#"),
-                headers: {
-                  ...DEFAULT_HEADERS,
-                  Referer: `${HOST}/live/${gid}/play`,
-                },
-                name: String(it.name || `直播源${index + 1}`),
-              };
+              const epName = String(it.name || `直播源${index + 1}`);
+              // playId 只存「哪场比赛 + 第几条线路」，播放时再拉一次 source，
+              // 好处：签名地址不会过期、playId 也短（不会因为 URL 太长被截断）
+              const playData = { g: String(gid), i: index, n: epName };
               return {
-                name: String(it.name || `直播源${index + 1}`),
+                name: epName,
                 playId: e64(JSON.stringify(playData)),
               };
             });
@@ -341,11 +374,8 @@ async function getDetailById(rawId) {
 
     if (pageUrl && pageUrl.startsWith("http")) {
       const playData = {
-        url: pageUrl,
-        headers: {
-          ...DEFAULT_HEADERS,
-        },
-        name: "直播页",
+        u: pageUrl,
+        n: "直播页",
       };
       return {
         vod_id: realId || gid,
@@ -520,15 +550,31 @@ async function play(params, context) {
   const flag = String(params?.flag || "play");
 
   try {
-    const encoded = params?.id || params?.playId || "";
-    const playData = JSON.parse(d64(encoded) || "{}") || {};
+    const encoded = String(params?.id || params?.playId || "");
+    logInfo("收到播放请求", { playIdLen: encoded.length });
 
-    const rawUrl = String(playData.url || "").trim();
-    const epName = String(playData.name || "播放");
+    const playData = JSON.parse(d64(encoded) || "{}") || {};
     const baseHeader = { ...DEFAULT_HEADERS, ...(playData.headers || {}) };
 
+    let epName = String(playData.n || playData.name || "播放");
+    let rawUrl = String(playData.url || playData.u || "").trim();
+
+    // 短 playId（{ g: gid, i: 线路序号 }）：现场拉一次 source 拿最新签名地址，
+    // 避免播放地址过期，也避免把超长 URL 塞进 playId。
+    const gid = String(playData.g || playData.gid || "");
+    if (!rawUrl && gid) {
+      const links = await fetchSourceLinks(gid);
+      const index = Number.isInteger(playData.i) ? playData.i : 0;
+      const picked = links[index] || links[0];
+      if (picked) {
+        rawUrl = picked.url;
+        if (!playData.n && picked.name) epName = picked.name;
+      }
+      logInfo("按比赛重新取线路", { gid, index, total: links.length, hit: !!picked });
+    }
+
     if (!rawUrl) {
-      logError("play 缺少播放地址", new Error("playData.url 为空"));
+      logError("play 缺少播放地址", new Error("playData 里没有可用的 url"));
       return { parse: 1, urls: [], flag, header: baseHeader };
     }
 
