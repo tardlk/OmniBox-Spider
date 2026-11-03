@@ -1,6 +1,6 @@
 // @name 88看球
 // @dependencies: axios, cheerio, crypto-js
-// @version 1.1.0
+// @version 1.1.1
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/88看球.js
 /**
  * 刮削：不支持
@@ -11,7 +11,8 @@
  * 1. 本脚本由 `本地调试/88看球.js` 转换为 OmniBox 标准模板结构。
  * 2. 接口包含：`home` / `category` / `search` / `detail` / `play`。
  * 3. 详情接口将旧式 `vod_play_from + vod_play_url` 转换为 `vod_play_sources`。
- * 4. `playId` 使用 Base64(JSON) 透传，播放阶段解码后按原逻辑返回 `parse=1`。
+ * 4. `playId` 使用 Base64(JSON) 透传；play 阶段优先抽出内层 m3u8 返回 `parse=0` 直链，
+ *    仅在确实解不出时才回退 `parse=1`（该模式只有 ok影视 会做客户端嗅探）。
  *
  * 变更记录：
  * - v1.1.0：网站改版，分类由4大类改为24子类，移除无效筛选；play-url API 改为 /source
@@ -466,37 +467,130 @@ async function search(params) {
 
 // ==================== 标准接口：play ==================== 
 /**
- * 播放解析
+ * 判断是否是可直连的媒体地址
  */
-async function play(params) {
+const MEDIA_URL_RE = /\.(m3u8|mp4|flv|ts|mkv)(\?|#|$)/i;
+
+/**
+ * 站点返回的线路地址常常是「播放页包一层真实地址」，形如：
+ *   https://play.88player.top/m3u8.html?url=https://play.aarray.cn/xxx.m3u8?auth_key=...
+ * 直接把外层页面丢给播放器会一直转圈（播放器拿到的是 HTML），所以这里先把内层地址解出来。
+ * @param {string} rawUrl
+ * @returns {string} 内层可直连地址，解不出则返回空串
+ */
+function extractInnerMediaUrl(rawUrl) {
+  const u = String(rawUrl || "").trim();
+  if (!u) return "";
+
+  try {
+    const parsed = new URL(u);
+    const inner = parsed.searchParams.get("url") || parsed.searchParams.get("u") || "";
+    if (inner && MEDIA_URL_RE.test(inner)) {
+      // 站点把内层地址直接拼在 ?url= 后面、不做编码，内层自带的 &token= / &device=
+      // 会被 URLSearchParams 截断；这类 host 改走下面的“取剩余全部”逻辑更稳。
+      if (!/88player|88kanqiu|aarray/i.test(parsed.hostname)) return inner;
+    }
+  } catch (_) {
+    // 非法 URL，走下面的正则兜底
+  }
+
+  // 兜底：从 url=/u= 开始一直取到结尾（保留内层自带的 query）
+  const m = u.match(/[?&](?:url|u)=(.+)$/i);
+  if (m) {
+    const raw = m[1];
+    let decoded = raw;
+    try {
+      decoded = decodeURIComponent(raw);
+    } catch (_) {
+      // 保持原样
+    }
+    for (const cand of [raw, decoded]) {
+      if (MEDIA_URL_RE.test(cand)) return cand;
+    }
+  }
+
+  return "";
+}
+
+/**
+ * 播放解析
+ * 优先返回 parse=0 的直链（urls 数组）；只有确实解析不出时才回退 parse=1 交给客户端嗅探。
+ */
+async function play(params, context) {
+  const flag = String(params?.flag || "play");
+
   try {
     const encoded = params?.id || params?.playId || "";
-    const decoded = d64(encoded);
-    const playData = JSON.parse(decoded || "{}");
+    const playData = JSON.parse(d64(encoded) || "{}") || {};
 
-    if (!playData?.url) {
+    const rawUrl = String(playData.url || "").trim();
+    const epName = String(playData.name || "播放");
+    const baseHeader = { ...DEFAULT_HEADERS, ...(playData.headers || {}) };
+
+    if (!rawUrl) {
+      logError("play 缺少播放地址", new Error("playData.url 为空"));
+      return { parse: 1, urls: [], flag, header: baseHeader };
+    }
+
+    // 1) 内嵌播放页：抽出真实 m3u8，直接给播放器
+    const innerUrl = extractInnerMediaUrl(rawUrl);
+    if (innerUrl) {
+      logInfo("已从播放页抽出直链", { name: epName, url: innerUrl.slice(0, 120) });
+      let referer = baseHeader.Referer;
+      try {
+        const host = new URL(rawUrl).hostname;
+        if (/88player|88kanqiu/.test(host)) referer = "https://play.88player.top/";
+      } catch (_) {
+        // ignore
+      }
       return {
-        parse: 1,
-        url: "",
-        header: { ...DEFAULT_HEADERS },
+        parse: 0,
+        urls: [{ name: epName, url: innerUrl }],
+        flag,
+        header: { ...baseHeader, Referer: referer },
       };
     }
 
+    // 2) 本身就是直链
+    if (MEDIA_URL_RE.test(rawUrl)) {
+      logInfo("直链播放", { name: epName, url: rawUrl.slice(0, 120) });
+      return {
+        parse: 0,
+        urls: [{ name: epName, url: rawUrl }],
+        flag,
+        header: baseHeader,
+      };
+    }
+
+    // 3) 普通播放页：交给服务端嗅探（需要完整运行环境）
+    if (typeof OmniBox.sniffVideo === "function") {
+      try {
+        const sniffed = await OmniBox.sniffVideo(rawUrl, baseHeader);
+        if (sniffed && sniffed.url) {
+          logInfo("嗅探成功", { name: epName, url: String(sniffed.url).slice(0, 120) });
+          return {
+            parse: 0,
+            urls: [{ name: epName, url: sniffed.url }],
+            flag,
+            header: { ...baseHeader, ...(sniffed.header || {}) },
+          };
+        }
+      } catch (sniffError) {
+        logError("嗅探失败", sniffError);
+      }
+    }
+
+    // 4) 兜底：交回客户端嗅探（parse=1 仅 ok影视 会处理，其它客户端会当直链，注意日志提示）
+    logInfo("无法解析直链，回退 parse=1（仅 ok影视 支持客户端嗅探）", { name: epName, url: rawUrl.slice(0, 120) });
     return {
       parse: 1,
-      url: playData.url,
-      header: {
-        ...DEFAULT_HEADERS,
-        ...(playData.headers || {}),
-      },
+      urls: [{ name: epName, url: rawUrl }],
+      flag,
+      header: baseHeader,
     };
   } catch (error) {
     logError("play 失败", error);
-    return {
-      parse: 1,
-      url: "",
-      header: { ...DEFAULT_HEADERS },
-    };
+    return { parse: 1, urls: [], flag, header: { ...DEFAULT_HEADERS } };
   }
 }
 
