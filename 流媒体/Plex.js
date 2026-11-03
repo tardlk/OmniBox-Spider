@@ -4,7 +4,7 @@
 // @dependencies: axios
 // @version 1.6.1
 // @indexs 影视
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/流媒体/Plex.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/流媒体/Plex.js
 
 /**
  * ============================================================================

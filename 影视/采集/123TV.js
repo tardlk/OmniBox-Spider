@@ -3,7 +3,7 @@
 // @description 刮削：支持，弹幕：支持，嗅探：支持，广告：菠菜
 // @dependencies: axios
 // @version 1.0.5
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/123TV.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/123TV.js
 
 /**
  * ============================================================================

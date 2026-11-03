@@ -2,7 +2,7 @@
 // @author @lucky_TJQ
 // @description 
 // @version 1.0.0
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/听书/酷我听书.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/听书/酷我听书.js
 
 /**
  * OmniBox 听书源脚本：酷我听书

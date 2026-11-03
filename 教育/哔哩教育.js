@@ -3,7 +3,7 @@
 // @description 刮削：不支持，弹幕：支持，嗅探：不支持，登录：支持
 // @dependencies: axios, crypto
 // @version 1.1.1
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/教育/哔哩教育.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/教育/哔哩教育.js
 
 const axios = require("axios");
 const crypto = require("crypto");

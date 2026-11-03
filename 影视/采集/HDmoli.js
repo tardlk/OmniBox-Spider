@@ -1,6 +1,6 @@
 // @name HDmoli
 // @version 1.0.8
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/HDmoli.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/HDmoli.js
 // @dependencies cheerio
 
 const OmniBox = require("omnibox_sdk");

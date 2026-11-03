@@ -3,7 +3,7 @@
 // @description 聚合玩偶、木偶、蜡笔、闪电、至臻、二小、虎斑、快映、欧哥、多多、蜗牛4K等网盘站点；支持刮削、弹幕、多线路、二级分类筛选、翻页、网盘排序
 // @dependencies axios,cheerio
 // @version 1.0.1
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/玩偶聚合-非分组.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/网盘/玩偶聚合-非分组.js
 
 const OmniBox = require("omnibox_sdk");
 const cheerio = require("cheerio");
@@ -26,7 +26,7 @@ module.exports = {
 runner.run(module.exports);
 
 // ==================== 配置区域 ====================
-const FILTER_CONFIG_BASE_URL = "https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/%E9%85%8D%E7%BD%AE/%E7%AD%9B%E9%80%89";
+const FILTER_CONFIG_BASE_URL = "https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/%E9%85%8D%E7%BD%AE/%E7%AD%9B%E9%80%89";
 
 // 网盘线路优先级（从高到低），可用环境变量 PAN_DRIVE_ORDER 覆盖（分号/逗号分隔，如 115;baidu;quark;uc）
 // 注意：内部 key 为 baidu/quark/a139/a189/a123/a115/xunlei/ali/uc，环境变量里可写 115/189/123/139 简写

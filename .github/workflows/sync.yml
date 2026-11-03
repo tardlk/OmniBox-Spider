@@ -22,7 +22,7 @@ jobs:
         id: sync
         uses: aormsby/fork-sync-with-upstream-action@v3.4.3
         with:
-          upstream_sync_repo: Silent1566/OmniBox-Spider
+          upstream_sync_repo: tardlk/OmniBox-Spider
           upstream_sync_branch: main
           target_sync_branch: main
           target_repo_token: ${{ secrets.GITHUB_TOKEN }}

@@ -3,7 +3,7 @@
 // @description 页面解析：首页/分类/播放页已接入；播放页直接解析 Artplayer 的 m3u8 地址与剧集列表
 // @dependencies cheerio
 // @version 1.1.1
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/人人影视PRO.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/人人影视PRO.js
 
 const OmniBox = require("omnibox_sdk");
 const runner = require("spider_runner");

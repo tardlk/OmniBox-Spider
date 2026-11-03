@@ -3,7 +3,7 @@
 // @description 
 // @dependencies: crypto-js
 // @version 1.0.0
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/听书/番茄畅听.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/听书/番茄畅听.js
 
 
 /**

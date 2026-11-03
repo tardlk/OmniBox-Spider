@@ -3,7 +3,7 @@
 // @description 影视站：支持首页、分类、详情、刮削、弹幕与播放；搜索受站点人机验证影响，失败时安全降级
 // @dependencies cheerio
 // @version 1.1.2
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/茶杯狐.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/茶杯狐.js
 
 const OmniBox = require("omnibox_sdk");
 const runner = require("spider_runner");

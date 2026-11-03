@@ -3,7 +3,7 @@
 // @description 意大利 StreamingCommunity 站点，支持电影/剧集、季集详情、VixCloud 播放下钻与 SDK 嗅探兜底
 // @dependencies: axios
 // @version 1.1.2
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/StreamingCommunity.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/StreamingCommunity.js
 
 const axios = require("axios");
 const OmniBox = require("omnibox_sdk");

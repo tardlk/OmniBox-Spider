@@ -2,7 +2,7 @@
 // @author 
 // @description 刮削：支持，弹幕：支持，播放记录：宿主自动，嗅探：支持
 // @version 1.1.2
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/荐片.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/荐片.js
 /**
  * ============================================================================
  * 荐片APP - OmniBox 爬虫脚本

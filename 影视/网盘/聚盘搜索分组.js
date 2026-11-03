@@ -3,7 +3,7 @@
 // @description 聚盘搜索分组版：搜索先按网盘分组，再进入二级结果；详情与播放沿用聚盘搜索的多层级展开、刮削与弹幕能力
 // @dependencies: axios
 // @version 1.0.3
-// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/聚盘搜索分组.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/网盘/聚盘搜索分组.js
 
 
 const axios = require("axios");
