@@ -2,7 +2,7 @@
 // @author W.Q, @wujiwanmei, @lucky_TJQ, tcxp, @shortai, 梦
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, crypto
-// @version 1.1.0
+// @version 1.1.1
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/3Q影视.js
 
 /**
@@ -66,6 +66,26 @@ const PLAY_HEADERS = {
     "Referer": `${ACTIVE_HOST}/`,
     "Origin": ACTIVE_HOST
 };
+
+// 字节跳动系 CDN（抖音/西瓜等）会拒绝带外站 Referer 的请求，实测：带站点 Referer → 403，去掉 → 200
+const CDN_STRIP_HEADER_RE = /(douyinvod|douyinpic|douyinstatic|douyin\.com|byteimg|ibytedtos|ixigua|bytedance)/i;
+
+function buildPlayHeaders(targetUrl, base = PLAY_HEADERS) {
+    const headers = { ...base };
+    let host = "";
+    try {
+        host = new URL(String(targetUrl || "")).hostname;
+    } catch (_) {
+        host = "";
+    }
+    if (host && CDN_STRIP_HEADER_RE.test(host)) {
+        delete headers.Referer;
+        delete headers.referer;
+        delete headers.Origin;
+        delete headers.origin;
+    }
+    return headers;
+}
 
 const normalizeHost = (url = "") => {
     const value = String(url || "").trim();
@@ -1833,11 +1853,11 @@ async function play(params) {
             }
         }
 
-        // 构建播放响应
+        // 构建播放响应（字节系 CDN 要去掉站点 Referer，否则 403）
         const playResponse = {
             urls: [{ name: "多多追剧", url: finalUrl }],
             parse: parseFlag,
-            header: playHeader
+            header: buildPlayHeaders(finalUrl, playHeader)
         };
 
         // ========== 弹幕匹配 ========== 
