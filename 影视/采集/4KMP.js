@@ -1,8 +1,8 @@
 // @name 4KMP
 // @author 梦
-// @description 4k-av.com：支持首页、分类、搜索、详情与直链播放，站点请求使用苹果 Safari UA；封面可用 KMP_IMG_PROXY=server/wsrv 加速
+// @description 4k-av.com：支持首页、分类、搜索、详情与直链播放，站点请求使用苹果 Safari UA；带请求节流与页面缓存以避免 Cloudflare 风控；封面可用 KMP_IMG_PROXY=server/wsrv 加速
 // @dependencies cheerio
-// @version 1.0.3
+// @version 1.0.5
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4KMP.js
 
 const OmniBox = require("omnibox_sdk");
@@ -12,6 +12,43 @@ const cheerio = require("cheerio");
 const BASE_URL = "https://4k-av.com";
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15";
 const REQUEST_TIMEOUT = Number(process.env.KMP_TIMEOUT || 20000);
+// 站点在 Cloudflare 后面，短时间内多次请求会直接 403（风控）。
+// 连续点击详情页 3~4 次就可能触发，触发后整个域名在一段时间内全返 403。
+const REQUEST_MIN_GAP = Number(process.env.KMP_MIN_GAP || 700);      // 两次请求的最小间隔 ms
+const PAGE_CACHE_TTL = Number(process.env.KMP_CACHE_TTL || 60000);   // 页面缓存秒数
+const BLOCK_COOLDOWN = Number(process.env.KMP_BLOCK_COOLDOWN || 180000); // 403 后主动冷静 ms
+const MAX_CACHE_ENTRIES = 40;
+
+let lastRequestAt = 0;
+let blockedUntil = 0;
+const pageCache = new Map();
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function throttle() {
+  const wait = REQUEST_MIN_GAP - (Date.now() - lastRequestAt);
+  if (wait > 0) await sleep(wait);
+  lastRequestAt = Date.now();
+}
+
+function readCache(url) {
+  const hit = pageCache.get(url);
+  if (!hit) return "";
+  if (Date.now() - hit.at > PAGE_CACHE_TTL * 1000) {
+    pageCache.delete(url);
+    return "";
+  }
+  return hit.text;
+}
+
+function writeCache(url, text) {
+  if (PAGE_CACHE_TTL <= 0) return;
+  if (pageCache.size >= MAX_CACHE_ENTRIES) {
+    const oldest = pageCache.keys().next().value;
+    if (oldest) pageCache.delete(oldest);
+  }
+  pageCache.set(url, { at: Date.now(), text });
+}
 
 const CLASS_LIST = [
   { type_id: "movie", type_name: "电影" },
@@ -118,11 +155,22 @@ function wrapImage(url, context) {
 }
 
 function buildHeaders(referer = `${BASE_URL}/`, extra = {}) {
+  const ref = referer || `${BASE_URL}/`;
+  // 站点在 Cloudflare 后面，只有 UA + Accept 的请求很容易被判成 bot。
+  // 补上真实 Safari 会带的 Sec-Fetch-* / Upgrade-Insecure-Requests，
+  // 能明显降低被风控的概率（拿不到 cf_clearance cookie，只能靠这些特征）。
+  const sameSite = ref.startsWith(BASE_URL);
   return {
     "User-Agent": UA,
     Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    Referer: referer || `${BASE_URL}/`,
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "max-age=0",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": sameSite ? "same-origin" : "none",
+    Referer: ref,
     ...extra,
   };
 }
@@ -137,9 +185,22 @@ function buildPlayHeaders(referer = `${BASE_URL}/`) {
 
 async function fetchText(url, options = {}) {
   const finalUrl = absUrl(url);
+
+  const cached = readCache(finalUrl);
+  if (cached) {
+    await OmniBox.log("info", `[4KMP][cache] hit ${finalUrl}`);
+    return cached;
+  }
+
+  if (blockedUntil > Date.now()) {
+    const left = Math.ceil((blockedUntil - Date.now()) / 1000);
+    throw new Error(`站点风控冷却中，约 ${left} 秒后自动恢复（别连续点）`);
+  }
+
   let lastError = "";
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+    if (attempt > 0) await sleep(1200 * attempt);
+    await throttle();
     await OmniBox.log("info", `[4KMP][request] ${finalUrl}`);
     const res = await OmniBox.request(finalUrl, {
       method: options.method || "GET",
@@ -148,10 +209,24 @@ async function fetchText(url, options = {}) {
       timeout: options.timeout || REQUEST_TIMEOUT,
     });
     const statusCode = Number(res?.statusCode || 0);
-    if (res && statusCode === 200) return getBodyText(res);
+    if (res && statusCode === 200) {
+      const text = getBodyText(res);
+      writeCache(finalUrl, text);
+      return text;
+    }
 
-    lastError = String(res?.statusCode || "unknown");
+    lastError = String(statusCode || "unknown");
     await OmniBox.log("warn", `[4KMP][request] attempt ${attempt + 1} HTTP ${lastError} @ ${finalUrl}`);
+
+    // 403 / 429 / 503 是 Cloudflare 风控，继续重试等于反复敲同一扇门，
+    // 只会把封禁时间拉长；这里直接放弃并进入冷静期。
+    if (statusCode === 403 || statusCode === 429 || statusCode === 503) {
+      blockedUntil = Date.now() + BLOCK_COOLDOWN;
+      throw new Error(
+        `站点返回 ${statusCode}（Cloudflare 风控）。已暂停 ${Math.round(BLOCK_COOLDOWN / 1000)} 秒，` +
+        `期间请勿反复点击；恢复后仍 403 说明该出口 IP 被临时封了，过 10~30 分钟再试`
+      );
+    }
   }
   throw new Error(`HTTP ${lastError} @ ${finalUrl}`);
 }
