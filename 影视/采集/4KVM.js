@@ -1,8 +1,8 @@
 // @name 4KVM
 // @author 
-// @description 刮削：支持，弹幕：支持，嗅探：支持
+// @description 刮削：支持，弹幕：支持，嗅探：支持，直取：支持
 // @dependencies: axios, cheerio
-// @version 1.2.5
+// @version 1.3.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4KVM.js
 
 /**
@@ -11,11 +11,16 @@
 * 刮削：支持
 * 弹幕：支持
 * 嗅探：支持
+* 直取：支持（wasm 签名直连，不用开浏览器，比嗅探快一个数量级）
 * ============================================================================
 */
 const axios = require("axios");
 const https = require("https");
 const http = require("http");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { pathToFileURL } = require("url");
 const cheerio = require("cheerio");
 const OmniBox = require("omnibox_sdk");
 
@@ -115,6 +120,178 @@ const decodeMeta = (str) => {
     } catch {
         return {};
     }
+};
+
+// ========== 播放地址直取（wasm 签名）==========
+// 站点播放页的 HTML 里没有任何 m3u8，播放器是这么干的：
+//   import('/static/wasm/nbmovie_wasm.js')
+//   build_play_url(dataid, secretKey, quality, userlink) -> "/video/play?p=..&s=..&t=..&k=.."
+//   fetch(该地址) -> { data: { quality_urls: [...] } }
+// 这里直接在 Node 里跑同一个 wasm，就不必再开无头浏览器嗅探（9s → 0.3s）。
+const WASM_DIR = path.join(os.tmpdir(), "k4vm-wasm");
+const RUNTIME_FILE = path.join(os.tmpdir(), "k4vm-runtime.json");
+// userlink 是每次渲染页面时现生成的（同一秒两次请求都不一样），只能用很短时间，
+// 过期就重新抓一次播放页。首页给的是 '0'，拿去签名必然 401，所以必须抓 /play/ 页。
+const RUNTIME_TTL = 2 * 60 * 1000;
+// q=1 是站点的 4K 档，后面几档是 1080/720/480
+const QUALITY_TRY = ["1", "1080", "720", "480"];
+
+let wasmModule = null;
+let wasmLoading = null;
+let runtimeCache = null;
+
+// 站点发给匿名访客的 userlink，以及带 hash 的 wasm 文件路径（发版会变）
+const loadSiteRuntime = async (pageUrl = "", force = false) => {
+    const now = Date.now();
+    const usable = (r) => r && r.userlink && r.userlink !== "0" && now - (r.ts || 0) < RUNTIME_TTL;
+    if (!force && usable(runtimeCache)) return runtimeCache;
+    if (!force) {
+        try {
+            const cached = JSON.parse(fs.readFileSync(RUNTIME_FILE, "utf8"));
+            if (usable(cached)) {
+                runtimeCache = cached;
+                return runtimeCache;
+            }
+        } catch (_) {}
+    }
+    // 优先抓播放页（首页的 userlink 恒为 '0'，签出来的地址直接 401）
+    const target = pageUrl && /\/play\//.test(pageUrl) ? pageUrl : `${config.host}/`;
+    const resp = await axiosInstance.get(target, { headers: { ...config.headers, Referer: `${config.host}/` } });
+    const $ = cheerio.load(resp.data);
+    const xdata = $("nav[x-data]").attr("x-data") || "";
+    const matched = xdata.match(/userlink\s*:\s*['"]([^'"]+)['"]/);
+    runtimeCache = {
+        userlink: matched ? matched[1] : "0",
+        jsPath: $("#wasm-cfg").attr("data-js") || (runtimeCache && runtimeCache.jsPath) || "/static/wasm/nbmovie_wasm.js",
+        bgPath: $("#wasm-cfg").attr("data-bg") || (runtimeCache && runtimeCache.bgPath) || "/static/wasm/nbmovie_wasm_bg.wasm",
+        ts: now,
+    };
+    try { fs.writeFileSync(RUNTIME_FILE, JSON.stringify(runtimeCache)); } catch (_) {}
+    logInfo("站点运行时参数已刷新", { from: target.replace(config.host, ""), userlink: runtimeCache.userlink });
+    return runtimeCache;
+};
+
+// detail 阶段页面已经在手上了，顺手把 userlink 和 wasm 路径存下来，play 时省一次请求
+const rememberRuntime = (userlink, jsPath, bgPath) => {
+    if (!userlink || userlink === "0") return;
+    runtimeCache = {
+        userlink,
+        jsPath: jsPath || (runtimeCache && runtimeCache.jsPath) || "/static/wasm/nbmovie_wasm.js",
+        bgPath: bgPath || (runtimeCache && runtimeCache.bgPath) || "/static/wasm/nbmovie_wasm_bg.wasm",
+        ts: Date.now(),
+    };
+    try { fs.writeFileSync(RUNTIME_FILE, JSON.stringify(runtimeCache)); } catch (_) {}
+};
+
+// 下载并初始化 wasm。wasm-bindgen 产物是 ESM，得存成 .mjs 才能 import
+const getWasm = async () => {
+    if (wasmModule) return wasmModule;
+    if (wasmLoading) return wasmLoading;
+    wasmLoading = (async () => {
+        const rt = await loadSiteRuntime();
+        fs.mkdirSync(WASM_DIR, { recursive: true });
+        const jsFile = path.join(WASM_DIR, "mod.mjs");
+        const wasmFile = path.join(WASM_DIR, "bg.wasm");
+        if (!fs.existsSync(jsFile) || !fs.existsSync(wasmFile)) {
+            const [jsResp, wasmResp] = await Promise.all([
+                axiosInstance.get(`${config.host}${rt.jsPath}`, {
+                    headers: config.headers,
+                    responseType: "text",
+                    transformResponse: [(d) => d],
+                }),
+                axiosInstance.get(`${config.host}${rt.bgPath}`, {
+                    headers: config.headers,
+                    responseType: "arraybuffer",
+                }),
+            ]);
+            fs.writeFileSync(jsFile, jsResp.data);
+            fs.writeFileSync(wasmFile, Buffer.from(wasmResp.data));
+            logInfo("wasm 资源已下载", { js: rt.jsPath, bg: rt.bgPath });
+        }
+        const mod = await import(pathToFileURL(jsFile).href);
+        // Node 下没有 file:// 的 fetch，必须把字节直接喂给 init
+        await mod.default({ module_or_path: new Uint8Array(fs.readFileSync(wasmFile)) });
+        wasmModule = mod;
+        logInfo("wasm 初始化完成");
+        return mod;
+    })().catch((e) => {
+        wasmLoading = null;
+        wasmModule = null;
+        throw e;
+    });
+    return wasmLoading;
+};
+
+// 抖音系 CDN（douyinbit / douyinvod / byteimg / ixigua）带外站 Referer 会 403
+const buildPlayHeaders = (url) => {
+    const u = String(url || "");
+    if (/douyinbit|douyinvod|byteimg|ixigua|bytedance|bytecdntp/i.test(u)) {
+        return { "User-Agent": PLAY_HEADERS["User-Agent"] };
+    }
+    return { ...PLAY_HEADERS };
+};
+
+const resolveViaWasm = async (dataId, secretKey, pageUrl) => {
+    if (!dataId || !secretKey) return null;
+    const mod = await getWasm();
+
+    const attempt = async (userlink) => {
+        for (const quality of QUALITY_TRY) {
+            let signed;
+            try {
+                signed = mod.build_play_url(String(dataId), String(secretKey), quality, userlink || "0");
+            } catch (e) {
+                logInfo(`wasm 签名失败 q=${quality}: ${e.message}`);
+                continue;
+            }
+            if (!signed) continue;
+
+            const t0 = Date.now();
+            let resp;
+            try {
+                resp = await axiosInstance.get(`${config.host}${signed}`, {
+                    headers: {
+                        ...config.headers,
+                        Referer: pageUrl || `${config.host}/`,
+                        Accept: "application/json, text/plain, */*",
+                    },
+                    responseType: "json",
+                });
+            } catch (e) {
+                logInfo(`wasm 取流失败 q=${quality}: ${e.message}`);
+                continue;
+            }
+
+            const data = resp.data && resp.data.data;
+            const list = (data && data.quality_urls) || [];
+            const usable = list.filter((x) => x && x.url && /^https?:\/\//i.test(x.url) && !x.locked);
+            logInfo(`直取 q=${quality}: 共 ${list.length} 档，可用 ${usable.length} 档，耗时 ${Date.now() - t0}ms`);
+            if (!usable.length) continue;
+
+            usable.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+            return {
+                // 站点的 bitrate 字段对 4K 是真码率(2160000)、对 1080 却是分辨率(1080)，
+                // 混着显示会变成"1080p 1k"，所以只留 title
+                urls: usable.map((x, i) => ({
+                    name: x.title || x.description || `线路${i + 1}`,
+                    url: x.url,
+                })),
+                parse: 0,
+                header: buildPlayHeaders(usable[0].url),
+            };
+        }
+        return null;
+    };
+
+    let rt = await loadSiteRuntime(pageUrl);
+    let result = await attempt(rt.userlink);
+    if (!result) {
+        // 多半是 userlink 过期（它按页面渲染现生成），重抓一次播放页再签
+        logInfo("直取未命中，刷新 userlink 重试一次");
+        rt = await loadSiteRuntime(pageUrl, true);
+        result = await attempt(rt.userlink);
+    }
+    return result;
 };
 
 /**
@@ -461,7 +638,7 @@ const parsePlaySources = (playLinks, vodName, videoId = "") => {
         const episodeName = parts[0] || '正片';
         const actualUrl = parts[1] || parts[0];
         const fid = `${videoId}#0#${epIndex}`;
-        const combinedId = `${actualUrl}|||${encodeMeta({ sid: String(videoId || ""), fid, v: vodName || "", e: episodeName })}`;
+        const combinedId = `${actualUrl}|||${encodeMeta({ sid: String(videoId || ""), fid, d: "", v: vodName || "", e: episodeName })}`;
 
         return {
             name: episodeName,
@@ -486,7 +663,7 @@ const buildSeasonPlaySources = (seasonSources, vodName, videoId = "") => {
             const episodeName = ep.name || '正片';
             const actualUrl = ep.url || '';
             const fid = `${videoId}#${seasonIndex}#${epIndex}`;
-            const combinedId = `${actualUrl}|||${encodeMeta({ sid: String(videoId || ""), fid, v: vodName || "", e: episodeName })}`;
+            const combinedId = `${actualUrl}|||${encodeMeta({ sid: String(videoId || ""), fid, d: "", v: vodName || "", e: episodeName })}`;
             return {
                 name: episodeName,
                 playId: combinedId,
@@ -521,7 +698,8 @@ const extractEpisodePlaySources = ($, vodName, videoId = "") => {
         }
 
         const fid = dataId || `${videoId}#${line}#${episodeNo || sourcesMap.get(sourceName).length + 1}`;
-        const combinedId = `${href}|||${encodeMeta({ sid: String(videoId || ""), fid, v: vodName || "", e: episodeName })}`;
+        // d 是本集的 dataid，play 时喂给 wasm 签名用；secretKey 从 href 末段取
+        const combinedId = `${href}|||${encodeMeta({ sid: String(videoId || ""), fid, d: dataId, v: vodName || "", e: episodeName })}`;
         sourcesMap.get(sourceName).push({
             name: episodeName,
             playId: combinedId,
@@ -930,6 +1108,18 @@ async function detail(params) {
         const metaKeywords = $('meta[name="keywords"]').attr('content') || '';
         const keywordParts = metaKeywords.split(',').map((s) => s.trim()).filter(Boolean);
 
+        // 顺手把播放要用的站点运行时参数存下来（userlink + wasm 路径），play 时省一次请求
+        const navXData = $('nav[x-data]').attr('x-data') || '';
+        const userlinkMatched = navXData.match(/userlink\s*:\s*['"]([^'"]+)['"]/);
+        if (userlinkMatched) {
+            rememberRuntime(
+                userlinkMatched[1],
+                $('#wasm-cfg').attr('data-js'),
+                $('#wasm-cfg').attr('data-bg')
+            );
+            logInfo("已缓存站点 userlink", { userlink: userlinkMatched[1] });
+        }
+
         const vod = {
             vod_id: videoId,
             vod_name: $('h1.text-xl, h1').first().text().trim() || $('meta[property="og:title"]').attr('content')?.replace(/\s*-\s*第\d+集.*$/, '') || '未知标题',
@@ -1192,6 +1382,26 @@ async function play(params) {
     }
 
     try {
+        // ① 首选：wasm 签名直取。站点播放页靠 build_play_url 算签名接口，
+        //    在 Node 里跑同一个 wasm 就能直接拿到 m3u8，不必开无头浏览器（9s → 0.3s）。
+        let fastResponse = null;
+        const secretKey = (String(playId || "").match(/\/play\/([^/?#]+)/) || [])[1] || "";
+        const dataId = playMeta && playMeta.d ? String(playMeta.d) : "";
+        if (secretKey && dataId) {
+            try {
+                fastResponse = await resolveViaWasm(dataId, secretKey, playId);
+                if (fastResponse) {
+                    logInfo(`直取命中: ${fastResponse.urls[0].url}`);
+                } else {
+                    logInfo("直取没有可用线路，回退嗅探");
+                }
+            } catch (error) {
+                logInfo(`直取失败，回退嗅探: ${error.message}`);
+            }
+        } else {
+            logInfo("缺少 dataid 或 secretKey，跳过直取", { secretKey, dataId });
+        }
+
         // 解析参数
         let dataPost = null;
         let dataNume = null;
@@ -1210,14 +1420,14 @@ async function play(params) {
             }
         }
 
-        let playResponse = {
+        let playResponse = fastResponse || {
             urls: [{ name: "4KVM", url: playId }],
             parse: 1,
             header: PLAY_HEADERS
         };
 
         // API调用
-        if (dataPost && dataNume) {
+        if (!fastResponse && dataPost && dataNume) {
             try {
                 const apiUrl = `${config.host}/wp-json/dooplayer/v1/post/${dataPost}`;
                 const apiResponse = await axiosInstance.get(apiUrl, {
