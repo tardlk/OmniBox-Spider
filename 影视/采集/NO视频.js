@@ -1,7 +1,7 @@
 // @name NO视频
-// @description NO视频 - https://www.novipnoad.us/ 海外剧集电影采集站（播放直达，不做无效嗅探）
+// @description NO视频 - https://www.novipnoad.us/ 海外剧集电影采集站（恢复 SDK 嗅探 + 详情页回退）
 // @dependencies cheerio
-// @version 1.2.0
+// @version 1.2.1
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/NO视频.js
 
 const cheerio = require("cheerio");
@@ -93,18 +93,9 @@ function detectTypeFromUrl(url = "") {
   return cat || null;
 }
 
-function pathToSlug(path = "") {
-  return String(path).replace(/^\/+|\/+$/g, "").replace(/\//g, "-");
-}
+// 纯数字 vod_id 与站点文章 ID 一致，宿主侧播放/历史链路最稳；
+// 同时兼容 1.2.0 曾短暂使用过的「数字-分类」格式 id
 
-// 列表项把真实分类路径编进 vod_id（如 154887-tv-korea），
-// detail() 才能一次请求命中详情页，不用再按 13 个分类逐个试探
-function buildVodId(numericId, href) {
-  const cat = detectTypeFromUrl(href);
-  return cat ? `${numericId}-${pathToSlug(cat.path)}` : numericId;
-}
-
-// 兼容老版本收藏/历史里的纯数字 vod_id
 function parseVideoId(videoId) {
   const raw = String(videoId || "").trim();
   const withPath = raw.match(/^(\d+)-([a-z-]+)$/i);
@@ -134,7 +125,7 @@ function parseCard($, el) {
   const numericId = extractNumericId(href);
   if (!numericId || !title) return null;
   return {
-    vod_id: buildVodId(numericId, href),
+    vod_id: numericId,
     vod_name: title,
     vod_pic: img,
     type_id: cat?.type_id || "",
@@ -274,14 +265,6 @@ async function detail(params, context) {
     const playInfoMatch = html.match(/window\.playInfo\s*=\s*\{[\s\S]*?pkey\s*:\s*"([^"]+)"/i);
     const pkey = playInfoMatch ? playInfoMatch[1] : "";
 
-    // 播放器 iframe 需要 ref=/movie/xxx.html 这种站内路径
-    let refPath = "";
-    try {
-      refPath = new URL(finalDetailUrl).pathname;
-    } catch {
-      refPath = `/movie/${videoId}.html`;
-    }
-
     const episodes = [];
     $("a.multilink-btn[data-vid]").each((_, el) => {
       const btn = $(el);
@@ -290,7 +273,7 @@ async function detail(params, context) {
       if (!vid || !pkey) return;
       episodes.push({
         name,
-        playId: buildPlayId({ videoId, detailUrl: finalDetailUrl, refPath, vid, pkey, title }),
+        playId: buildPlayId({ videoId, detailUrl: finalDetailUrl, vid, pkey, title }),
       });
     });
 
@@ -301,7 +284,7 @@ async function detail(params, context) {
       if (vid && singlePkey) {
         episodes.push({
           name: "在线播放",
-          playId: buildPlayId({ videoId, detailUrl: finalDetailUrl, refPath, vid, pkey: singlePkey, title }),
+          playId: buildPlayId({ videoId, detailUrl: finalDetailUrl, vid, pkey: singlePkey, title }),
         });
       }
     }
@@ -317,7 +300,7 @@ async function detail(params, context) {
       vod_play_sources: episodes.length ? [{ name: "NO视频", episodes }] : [],
     };
 
-    await logInfo(`detail ${rawVideoId} episodes=${episodes.length} 请求=${tried} 耗时=${Date.now() - started}ms ${directUrl ? "路径直达" : "兼容旧ID"}`);
+    await logInfo(`detail ${rawVideoId} episodes=${episodes.length} 请求=${tried} 耗时=${Date.now() - started}ms ${directUrl ? "路径直达" : "?p= 跳转"}`);
     return { list: [vod] };
   } catch (e) {
     await logError(`detail 异常: ${e.message}`);
@@ -357,25 +340,63 @@ async function search(params, context) {
   }
 }
 
+// 站点详情页本身不会自动起播：必须点击 .multilink-btn 才会插入
+// player.novipnoad.us/v1/ iframe -> player.php -> enc-vod 配置 -> 真实流。
+// 所以播放结果必须保留 SDK 嗅探 + parse=1 页面回退这两条链路；
+// 1.2.0 只回 parse=1 详情页、又去掉了嗅探，在网页端/TVBox 上等于给了个空页面。
+async function sniffNoVideoPlay(playUrl) {
+  if (!OmniBox.sniffVideo) return null;
+  const started = Date.now();
+  try {
+    const sniffed = await OmniBox.sniffVideo(playUrl, {
+      "User-Agent": UA,
+      Referer: HOST + "/",
+    });
+    if (sniffed && sniffed.url) {
+      await logInfo(`嗅探成功 耗时=${Date.now() - started}ms url=${String(sniffed.url).slice(0, 160)}`);
+      return {
+        urls: [{ name: "嗅探线路", url: sniffed.url }],
+        parse: 0,
+        header: {
+          "User-Agent": UA,
+          Referer: playUrl,
+          ...(sniffed.header || {}),
+        },
+      };
+    }
+    await logInfo(`嗅探无结果 耗时=${Date.now() - started}ms url=${playUrl}`);
+  } catch (e) {
+    await logInfo(`嗅探失败 耗时=${Date.now() - started}ms: ${e.message}`);
+  }
+  return null;
+}
+
 async function play(params, context) {
   const started = Date.now();
   try {
     const meta = parsePlayId(params.playId || "");
-    // 站点播放链路是三层：详情页 -> player 子域 iframe -> enc-vod 配置 + wasm 浏览器校验。
-    // 服务端 sniffVideo 对详情页和 iframe 实测都是 9~11 秒后失败（exit status 1），
-    // 白等一轮只会拖慢启播；而且播放器页单独作为顶层打开时 wasm 不写 vkey，根本不出流。
-    // 因此这里不再嗅探，直接把详情页交给客户端 webview，由站内播放器自己完成鉴权。
-    const detailUrl = meta.detailUrl || (meta.videoId ? `${HOST}/?p=${meta.videoId}` : "");
-    if (!detailUrl) {
+    const playUrl = meta.detailUrl || (meta.videoId ? `${HOST}/?p=${meta.videoId}` : "");
+    if (!playUrl) {
       await logError("play 缺少 detailUrl，无法构造播放页");
       return { urls: [], parse: 1 };
     }
-    await logInfo(`play 直达 ${detailUrl} 耗时=${Date.now() - started}ms`);
+    await logInfo(`play 开始 vid=${meta.vid || ""} url=${playUrl}`);
+
+    // NOVIDEO_SKIP_SNIFF=1 可跳过嗅探，仅保留页面回退（供 ok影视等自带 webview 的端对比测试）
+    if (String(process.env.NOVIDEO_SKIP_SNIFF || "") !== "1") {
+      const sniffResult = await sniffNoVideoPlay(playUrl);
+      if (sniffResult) return sniffResult;
+    } else {
+      await logInfo("play 按 NOVIDEO_SKIP_SNIFF=1 跳过嗅探");
+    }
+
+    // 与 1.0.2 一致的兜底：把详情页交给客户端 webview，由站内播放器完成点击与鉴权
+    await logInfo(`play 回退 parse=1 耗时=${Date.now() - started}ms`);
     return {
-      urls: [{ name: meta.title || "NO视频", url: detailUrl }],
+      urls: [{ name: meta.title || "NO视频", url: playUrl }],
       parse: 1,
       header: {
-        Referer: detailUrl,
+        Referer: playUrl,
         "User-Agent": UA,
       },
     };
