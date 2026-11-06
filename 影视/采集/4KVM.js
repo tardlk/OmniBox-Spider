@@ -2,7 +2,7 @@
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio
-// @version 1.2.3
+// @version 1.2.4
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4KVM.js
 
 /**
@@ -20,15 +20,38 @@ const cheerio = require("cheerio");
 const OmniBox = require("omnibox_sdk");
 
 // ========== 全局配置 ========== 
+// 站点换过域名：.org → .net。默认跟 .net，可用 K4VM_HOST 覆盖回 .org 或新域名
+const K4VM_HOST = (process.env.K4VM_HOST || "https://www.4kvm.net").replace(/\/+$/, "");
 const config = {
-    host: "https://www.4kvm.org",
+    host: K4VM_HOST,
     headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": "https://www.4kvm.org/",
+        "Referer": `${K4VM_HOST}/`,
         "Cache-Control": "no-cache"
     }
+};
+
+// 封面图默认还原成源站直连（4kvm.staticimgjs.org）。
+// 站点给的是百度图床代理：gimg0.baidu.com/gimg/app=2001&...&src=<真实地址>，
+// 这种 URL 没有 "?"，部分播放器/图片库解析会出错，且多一跳代理。
+// 想用回百度代理（更快）设 K4VM_IMG=baidu。
+const K4VM_IMG = String(process.env.K4VM_IMG || "direct").toLowerCase();
+
+const unwrapImage = (url) => {
+    const u = String(url || "").trim();
+    if (!u || K4VM_IMG === "baidu") return u;
+    if (/gimg\d*\.baidu\.com/i.test(u)) {
+        const m = u.match(/[?&]src=([^&]+)$/);
+        if (m) {
+            let real = m[1];
+            try { real = decodeURIComponent(real); } catch (_) {}
+            if (!/^https?:\/\//i.test(real)) real = `https://${real.replace(/^\/+/, "")}`;
+            return real;
+        }
+    }
+    return u;
 };
 
 // 弹幕 API 地址(优先使用环境变量)
@@ -42,8 +65,8 @@ const axiosInstance = axios.create({
 
 const PLAY_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-    "Referer": "https://www.4kvm.org/",
-    "Origin": "https://www.4kvm.org"
+    "Referer": `${K4VM_HOST}/`,
+    "Origin": K4VM_HOST
 };
 
 /**
@@ -162,10 +185,10 @@ const extractVideoBasic = ($item) => {
             '未知标题'
         );
 
-        const img = normalizeUrl(
+        const img = unwrapImage(normalizeUrl(
             $item.find('img').attr('data-src') ||
             $item.find('img').attr('src')
-        );
+        ));
 
         const remarks = (
             $item.find('.absolute.bottom-0 span').last().text().trim() ||
@@ -219,7 +242,7 @@ const getSearchVideoList = ($) => {
         );
         if (!title) return;
 
-        const pic = normalizeUrl($a.find('img').attr('data-src') || $a.find('img').attr('src'));
+        const pic = unwrapImage(normalizeUrl($a.find('img').attr('data-src') || $a.find('img').attr('src')));
         const remarks = (
             $a.find('.absolute.top-2.right-2').text().trim() ||
             $a.find('.absolute.bottom-0 p').text().trim() ||
@@ -783,10 +806,16 @@ async function home(params) {
         const seen = new Set();
         $('nav a.nav-item').each((_, element) => {
             const $el = $(element);
-            const link = normalizeUrl($el.attr('href'));
+            const rawHref = $el.attr('href') || '';
+            const link = normalizeUrl(rawHref);
             const name = $el.text().trim();
             if (!link || !name || ['首页', '影片下载', '片单'].includes(name)) return;
-            if (!/^https?:\/\/www\.4kvm\.org\/(movie|tv|anime|filter)/.test(link)) return;
+            // 不能写死域名（.org 已换 .net），只看路径
+            let navPath = rawHref;
+            if (/^https?:\/\//i.test(rawHref)) {
+                try { navPath = new URL(rawHref).pathname; } catch (_) { navPath = rawHref; }
+            }
+            if (!/^\/(movie|tv|anime|filter)/.test(navPath)) return;
             if (seen.has(link)) return;
             seen.add(link);
             classes.push({ type_id: link, type_name: name });
@@ -878,7 +907,7 @@ async function detail(params) {
         const vod = {
             vod_id: videoId,
             vod_name: $('h1.text-xl, h1').first().text().trim() || $('meta[property="og:title"]').attr('content')?.replace(/\s*-\s*第\d+集.*$/, '') || '未知标题',
-            vod_pic: normalizeUrl($('.video-player').attr('data-poster') || $('.video-player img').attr('src') || metaPic),
+            vod_pic: unwrapImage(normalizeUrl($('.video-player').attr('data-poster') || $('.video-player img').attr('src') || metaPic)),
             vod_content: $('.bg-dark-800 p.text-xs.text-gray-300.leading-relaxed').first().text().trim() || metaDesc.trim(),
             vod_year: detailMap['年份'] || '',
             vod_area: detailMap['地区'] || detailMap['国家/地区'] || '',
