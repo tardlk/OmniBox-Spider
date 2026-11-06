@@ -2,7 +2,7 @@
 // @author W.Q, @wujiwanmei, @lucky_TJQ, tcxp, @shortai, 梦
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, crypto
-// @version 1.1.1
+// @version 1.1.2
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/3Q影视.js
 
 /**
@@ -698,6 +698,8 @@ function wasmBuildImports() {
 
 let wasmReady = false;
 let wasmInitPromise = null;
+// 最近一次解码失败的上游原因（供 play() 回传给客户端，避免只看到空地址）
+let lastDecodeError = "";
 
 /**
  * 初始化 WASM 解码模块
@@ -885,6 +887,7 @@ async function decodeEncryptedUrl(rawUrl, vodFrom) {
     if (!wasmReady) {
         const ok = await initWasm();
         if (!ok) {
+            lastDecodeError = "解码模块初始化失败";
             logError('WASM 模块未就绪', new Error('初始化失败'));
             return null;
         }
@@ -906,6 +909,7 @@ async function decodeEncryptedUrl(rawUrl, vodFrom) {
 
         // 4. 检查响应状态
         if (resp.status !== 200) {
+            lastDecodeError = `解码接口返回 HTTP ${resp.status}`;
             logError('解码请求失败', new Error(`HTTP ${resp.status}`));
             return null;
         }
@@ -919,9 +923,11 @@ async function decodeEncryptedUrl(rawUrl, vodFrom) {
             return result.data;
         }
 
+        lastDecodeError = result.msg || `code=${result.code}`;
         logError('解码失败', new Error(`code=${result.code}, msg=${result.msg}`));
         return null;
     } catch (e) {
+        lastDecodeError = e.message || "解码异常";
         logError('解码过程异常', e);
         return null;
     }
@@ -1831,11 +1837,13 @@ async function play(params) {
                 logInfo(`解码成功: ${play_from} -> ${finalUrl.substring(0, 80)}...`);
             } else {
                 logError('解码失败', new Error(`无法解码 ${play_from}: ${raw_url.substring(0, 40)}...`));
-                // 解码失败，返回空地址
+                // 解码失败：返回空 urls（而不是 url:""），并带上原因。
+                // 空字符串地址会让播放器一直转圈加载；空数组客户端会直接提示无可用地址。
                 return {
-                    urls: [{ name: "多多追剧", url: "" }],
+                    urls: [],
                     parse: 0,
-                    header: PLAY_HEADERS
+                    header: PLAY_HEADERS,
+                    msg: `线路「${flag || play_from}」暂不可用：${lastDecodeError || "上游解码失败"}`
                 };
             }
         }
