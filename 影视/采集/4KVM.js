@@ -2,7 +2,7 @@
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio
-// @version 1.2.4
+// @version 1.2.5
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4KVM.js
 
 /**
@@ -33,24 +33,43 @@ const config = {
     }
 };
 
-// 封面图默认还原成源站直连（4kvm.staticimgjs.org）。
-// 站点给的是百度图床代理：gimg0.baidu.com/gimg/app=2001&...&src=<真实地址>，
-// 这种 URL 没有 "?"，部分播放器/图片库解析会出错，且多一跳代理。
-// 想用回百度代理（更快）设 K4VM_IMG=baidu。
-const K4VM_IMG = String(process.env.K4VM_IMG || "direct").toLowerCase();
+// 封面图策略（K4VM_IMG）：
+//   baidu  默认。保留站点给的百度图床代理 gimg0.baidu.com/gimg/app=2001&...&src=<真实地址>。
+//          站点自己的前端就用这个地址，国内 CDN 直连最快；遇到 image.tmdb.org 这种
+//          国内根本连不上的图，会再包一层百度代理，保证客户端一定能拿到图。
+//   direct 还原成源站直连（4kvm.staticimgjs.org），海外网络/挂代理时更快。
+const K4VM_IMG = String(process.env.K4VM_IMG || "baidu").toLowerCase();
 
-const unwrapImage = (url) => {
+const BAIDU_IMG_RE = /gimg\d*\.baidu\.com/i;
+// 判断"这张图是不是 tmdb 的"：代理 URL 里也带 tmdb.org，所以只认域名子串
+const TMDB_IMG_RE = /image\.tmdb\.org/i;
+
+// 包一层百度图床代理（国内可达，且按 JPEG 压缩后体积更小）
+const baiduWrap = (url) => {
     const u = String(url || "").trim();
-    if (!u || K4VM_IMG === "baidu") return u;
-    if (/gimg\d*\.baidu\.com/i.test(u)) {
-        const m = u.match(/[?&]src=([^&]+)$/);
-        if (m) {
-            let real = m[1];
-            try { real = decodeURIComponent(real); } catch (_) {}
-            if (!/^https?:\/\//i.test(real)) real = `https://${real.replace(/^\/+/, "")}`;
-            return real;
-        }
+    if (!u) return u;
+    return `https://gimg0.baidu.com/gimg/app=2001&n=0&g=0n&fmt=jpeg&src=${u.replace(/^https?:\/\//i, "")}`;
+};
+
+// 从百度代理 URL 里取回原始地址
+const baiduUnwrap = (url) => {
+    const m = String(url || "").match(/[?&]src=([^&]+)$/);
+    if (!m) return "";
+    let real = m[1];
+    try { real = decodeURIComponent(real); } catch (_) {}
+    if (!/^https?:\/\//i.test(real)) real = `https://${real.replace(/^\/+/, "")}`;
+    return real;
+};
+
+// 统一封面出口：保证交给客户端的地址一定打得开
+const finalizeImage = (url) => {
+    const u = String(url || "").trim();
+    if (!u) return "";
+    if (K4VM_IMG === "direct") {
+        return BAIDU_IMG_RE.test(u) ? (baiduUnwrap(u) || u) : u;
     }
+    if (BAIDU_IMG_RE.test(u)) return u;            // 站点已经是国内代理，直接用
+    if (TMDB_IMG_RE.test(u)) return baiduWrap(u);  // tmdb 国内连不上，套一层国内代理
     return u;
 };
 
@@ -164,6 +183,24 @@ const normalizeUrl = (url) => {
 };
 
 /**
+* 取卡片上的角标文字（"4k" / "全30集" / "更新至12集"）
+* 注意：原来的 `.absolute.bottom-0 span` 匹配不到那个 span 自身（它就是容器），
+* 于是落到 `.year, .date, span` 兜底，把整段剧情简介当成 remarks 抓了回来。
+*/
+const pickCardRemarks = ($el) => {
+    const raw = (
+        $el.find('span.absolute.bottom-0').first().text().trim() ||
+        $el.find('span[class*="bottom-0"]').first().text().trim() ||
+        $el.find('.text-xs.text-gray-400').last().text().trim() ||
+        $el.find('.rating, .imdb, .vote').text().trim() ||
+        ''
+    );
+    const text = raw.replace(/\s+/g, ' ').trim();
+    // 超过 20 字基本是简介/简介残段，直接丢掉，别把卡片角标撑爆
+    return text && text.length <= 20 ? text : '';
+};
+
+/**
 * 提取视频基本信息
 */
 const extractVideoBasic = ($item) => {
@@ -185,19 +222,12 @@ const extractVideoBasic = ($item) => {
             '未知标题'
         );
 
-        const img = unwrapImage(normalizeUrl(
+        const img = finalizeImage(normalizeUrl(
             $item.find('img').attr('data-src') ||
             $item.find('img').attr('src')
         ));
 
-        const remarks = (
-            $item.find('.absolute.bottom-0 span').last().text().trim() ||
-            $item.find('.text-xs.text-gray-400').last().text().trim() ||
-            $item.find('.rating, .imdb, .vote').text().trim() ||
-            $item.find('.year, .date, span').text().trim() ||
-            $item.find('.type, .genre, .tag').text().trim() ||
-            ''
-        );
+        const remarks = pickCardRemarks($item);
 
         return {
             vod_id: link,
@@ -242,12 +272,8 @@ const getSearchVideoList = ($) => {
         );
         if (!title) return;
 
-        const pic = unwrapImage(normalizeUrl($a.find('img').attr('data-src') || $a.find('img').attr('src')));
-        const remarks = (
-            $a.find('.absolute.top-2.right-2').text().trim() ||
-            $a.find('.absolute.bottom-0 p').text().trim() ||
-            ''
-        );
+        const pic = finalizeImage(normalizeUrl($a.find('img').attr('data-src') || $a.find('img').attr('src')));
+        const remarks = pickCardRemarks($a);
 
         seen.add(href);
         videos.push({
@@ -907,7 +933,13 @@ async function detail(params) {
         const vod = {
             vod_id: videoId,
             vod_name: $('h1.text-xl, h1').first().text().trim() || $('meta[property="og:title"]').attr('content')?.replace(/\s*-\s*第\d+集.*$/, '') || '未知标题',
-            vod_pic: unwrapImage(normalizeUrl($('.video-player').attr('data-poster') || $('.video-player img').attr('src') || metaPic)),
+            // 详情页的 data-poster 是 tmdb 原图（820KB+，国内还连不上），
+            // og:image 才是站点自己的竖版海报（300x450，几十 KB），优先用它。
+            vod_pic: finalizeImage(normalizeUrl(
+                metaPic ||
+                $('.video-player').attr('data-poster') ||
+                $('.video-player img').attr('src')
+            )),
             vod_content: $('.bg-dark-800 p.text-xs.text-gray-300.leading-relaxed').first().text().trim() || metaDesc.trim(),
             vod_year: detailMap['年份'] || '',
             vod_area: detailMap['地区'] || detailMap['国家/地区'] || '',
@@ -1024,7 +1056,12 @@ async function detail(params) {
         if (scrapeData) {
             vod.vod_name = scrapeData.title || vod.vod_name;
             if (scrapeData.posterPath) {
-                vod.vod_pic = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
+                // 站点已经有自己的封面就留着（更快、更贴站点）；
+                // 只有站点没封面、或封面来自 tmdb 时，才用刮削图（w500 比 original 小得多）。
+                const tmdbPoster = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
+                if (!vod.vod_pic || TMDB_IMG_RE.test(vod.vod_pic)) {
+                    vod.vod_pic = finalizeImage(tmdbPoster);
+                }
             }
             if (scrapeData.overview) {
                 vod.vod_content = scrapeData.overview;
@@ -1049,6 +1086,11 @@ async function detail(params) {
 
         const totalEpisodes = playSources.reduce((sum, source) => sum + (source.episodes || []).length, 0);
         logInfo(`播放线路数: ${playSources.length}, 总集数: ${totalEpisodes}`);
+
+        // 详情页常常没有"状态"字段，用总集数补一个，卡片上至少有个标签
+        if (!vod.vod_remarks) {
+            vod.vod_remarks = totalEpisodes > 1 ? `全${totalEpisodes}集` : '';
+        }
 
         return {
             list: [vod]
