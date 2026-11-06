@@ -2,7 +2,7 @@
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持，直取：支持
 // @dependencies: axios, cheerio
-// @version 1.3.0
+// @version 1.3.1
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4KVM.js
 
 /**
@@ -39,11 +39,14 @@ const config = {
 };
 
 // 封面图策略（K4VM_IMG）：
-//   baidu  默认。保留站点给的百度图床代理 gimg0.baidu.com/gimg/app=2001&...&src=<真实地址>。
-//          站点自己的前端就用这个地址，国内 CDN 直连最快；遇到 image.tmdb.org 这种
-//          国内根本连不上的图，会再包一层百度代理，保证客户端一定能拿到图。
-//   direct 还原成源站直连（4kvm.staticimgjs.org），海外网络/挂代理时更快。
-const K4VM_IMG = String(process.env.K4VM_IMG || "baidu").toLowerCase();
+//   direct 默认。还原成源站直连 https://4kvm.staticimgjs.org/uploads/...（无 query 参数）。
+//          必须默认这个，原因见下：OmniBox 是 Go 写的，json.Marshal 默认开 EscapeHTML，
+//          会把 URL 里的 & 转成字面量 \u0026 发给 TVBox。浏览器 JSON.parse 会还原，
+//          所以网页端正常；但 TVBox 若把 \u0026 原样塞进图片请求，封面必然加载失败。
+//          只有不带 & 的地址才能同时兼容网页端和 TVBox。
+//   baidu  保留站点给的百度图床代理 gimg0.baidu.com/gimg/app=2001&...&src=<真实地址>。
+//          国内 CDN 最快，但自带 & —— 网页端没问题，TVBox 大概率看不到封面。
+const K4VM_IMG = String(process.env.K4VM_IMG || "direct").toLowerCase();
 
 const BAIDU_IMG_RE = /gimg\d*\.baidu\.com/i;
 // 判断"这张图是不是 tmdb 的"：代理 URL 里也带 tmdb.org，所以只认域名子串
@@ -66,16 +69,19 @@ const baiduUnwrap = (url) => {
     return real;
 };
 
-// 统一封面出口：保证交给客户端的地址一定打得开
+// 统一封面出口：交给客户端的地址必须"不含 &"，否则 TVBox 会拿到 \u0026
 const finalizeImage = (url) => {
     const u = String(url || "").trim();
     if (!u) return "";
-    if (K4VM_IMG === "direct") {
-        return BAIDU_IMG_RE.test(u) ? (baiduUnwrap(u) || u) : u;
+    const real = BAIDU_IMG_RE.test(u) ? (baiduUnwrap(u) || u) : u;
+    if (K4VM_IMG === "baidu") {
+        if (BAIDU_IMG_RE.test(u)) return u;            // 已经是国内代理
+        if (TMDB_IMG_RE.test(real)) return baiduWrap(real);
+        return real;
     }
-    if (BAIDU_IMG_RE.test(u)) return u;            // 站点已经是国内代理，直接用
-    if (TMDB_IMG_RE.test(u)) return baiduWrap(u);  // tmdb 国内连不上，套一层国内代理
-    return u;
+    // direct：源站直连，不带 query，TVBox 才认得
+    if (TMDB_IMG_RE.test(real)) return "";             // tmdb 国内连不上，宁可无图也别给裂图
+    return real;
 };
 
 // 弹幕 API 地址(优先使用环境变量)
@@ -1149,6 +1155,8 @@ async function detail(params) {
         }
 
         logInfo(`视频标题: ${vod.vod_name}`);
+        // 封面排障用：TVBox 端看不到图时，先看这里是不是带 & 的地址
+        logInfo(`封面地址: ${vod.vod_pic || "(空)"}`);
 
         // 获取播放链接：优先使用新前端已渲染好的选集锚点
         let playLinks = extractPlayOptions($, videoId);
