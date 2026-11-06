@@ -1,7 +1,7 @@
 // @name NO视频
-// @description NO视频 - https://www.novipnoad.net/ 海外剧集电影采集站
+// @description NO视频 - https://www.novipnoad.us/ 海外剧集电影采集站（播放直达，不做无效嗅探）
 // @dependencies cheerio
-// @version 1.0.2
+// @version 1.2.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/NO视频.js
 
 const cheerio = require("cheerio");
@@ -11,7 +11,8 @@ const runner = require("spider_runner");
 module.exports = { home, category, detail, search, play };
 runner.run(module.exports);
 
-const HOST = "https://www.novipnoad.net";
+// 站点换过域名：.net 已挂，现在走 .us
+const HOST = "https://www.novipnoad.us";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36";
 
 const CATEGORIES = [
@@ -92,6 +93,30 @@ function detectTypeFromUrl(url = "") {
   return cat || null;
 }
 
+function pathToSlug(path = "") {
+  return String(path).replace(/^\/+|\/+$/g, "").replace(/\//g, "-");
+}
+
+// 列表项把真实分类路径编进 vod_id（如 154887-tv-korea），
+// detail() 才能一次请求命中详情页，不用再按 13 个分类逐个试探
+function buildVodId(numericId, href) {
+  const cat = detectTypeFromUrl(href);
+  return cat ? `${numericId}-${pathToSlug(cat.path)}` : numericId;
+}
+
+// 兼容老版本收藏/历史里的纯数字 vod_id
+function parseVideoId(videoId) {
+  const raw = String(videoId || "").trim();
+  const withPath = raw.match(/^(\d+)-([a-z-]+)$/i);
+  if (withPath) {
+    const path = `/${withPath[2].replace(/-/g, "/")}/`;
+    const cat = CATEGORIES.find((item) => item.path === path);
+    if (cat) return { numericId: withPath[1], directUrl: `${HOST}${cat.path}${withPath[1]}.html` };
+  }
+  const numericId = /^\d+$/.test(raw) ? raw : extractNumericId(raw);
+  return { numericId, directUrl: "" };
+}
+
 function parseCard($, el) {
   const root = $(el).closest(".video-item, article.post, .post, div[class*='video-item']");
   const anchor = root.find(".item-thumbnail a, h3 a, h2 a, a[href$='.html']").first();
@@ -106,10 +131,10 @@ function parseCard($, el) {
     root.find("img[src]").first().attr("src") || ""
   );
   const cat = detectTypeFromUrl(href);
-  const vodId = extractNumericId(href);
-  if (!vodId || !title) return null;
+  const numericId = extractNumericId(href);
+  if (!numericId || !title) return null;
   return {
-    vod_id: vodId,
+    vod_id: buildVodId(numericId, href),
     vod_name: title,
     vod_pic: img,
     type_id: cat?.type_id || "",
@@ -136,36 +161,23 @@ async function fetchCategoryPage(category, page) {
   return { url, html };
 }
 
-async function resolveDetailPage(videoId) {
-  const paths = CATEGORIES.map((item) => `${HOST}${item.path}${videoId}.html`);
-  for (const url of paths) {
-    const html = await requestHtml(url);
-    if (html && !/未找到页面|404!|Page not found/i.test(html)) {
-      return { url, html };
-    }
-  }
-  return { url: "", html: "" };
-}
+async function resolveDetailPage(videoId, directUrl = "") {
+  const urls = [];
+  if (directUrl) urls.push(directUrl);
+  // WordPress 固定链接 /?p=<id> 会 301 到真实详情页，requestHtml 自动跟随跳转
+  urls.push(`${HOST}/?p=${videoId}`);
+  for (const item of CATEGORIES) urls.push(`${HOST}${item.path}${videoId}.html`);
 
-async function sniffNoVideoPlay(playUrl) {
-  try {
-    if (!OmniBox.sniffVideo) return null;
-    const sniffed = await OmniBox.sniffVideo(playUrl);
-    if (sniffed && sniffed.url) {
-      await logInfo(`嗅探成功 ${playUrl}`);
-      return {
-        urls: [{ name: "嗅探线路", url: sniffed.url }],
-        parse: 0,
-        header: sniffed.header || {
-          Referer: playUrl,
-          "User-Agent": UA,
-        },
-      };
+  let tried = 0;
+  for (const url of urls) {
+    tried += 1;
+    const html = await requestHtml(url);
+    // 必须带播放信息才是真详情页，避免把 404 / 首页误判成成功
+    if (html && /window\.playInfo|multilink-btn/.test(html) && !/未找到页面|404!|Page not found/i.test(html)) {
+      return { url, html, tried };
     }
-  } catch (e) {
-    await logInfo(`嗅探失败 ${playUrl}: ${e.message}`);
   }
-  return null;
+  return { url: "", html: "", tried };
 }
 
 function buildPlayId(payload) {
@@ -235,10 +247,16 @@ async function category(params, context) {
 
 async function detail(params, context) {
   try {
-    const videoId = String(params.videoId || "").trim();
+    const rawVideoId = String(params.videoId || "").trim();
+    if (!rawVideoId) return { list: [] };
+    const { numericId: videoId, directUrl } = parseVideoId(rawVideoId);
     if (!videoId) return { list: [] };
-    const { url, html } = await resolveDetailPage(videoId);
-    if (!html) return { list: [] };
+    const started = Date.now();
+    const { url, html, tried } = await resolveDetailPage(videoId, directUrl);
+    if (!html) {
+      await logError(`detail ${rawVideoId} 未找到详情页，尝试 ${tried} 个地址`);
+      return { list: [] };
+    }
     const $ = cheerio.load(html);
 
     const finalDetailUrl = absUrl($("meta[property='og:url']").attr("content") || url);
@@ -256,6 +274,14 @@ async function detail(params, context) {
     const playInfoMatch = html.match(/window\.playInfo\s*=\s*\{[\s\S]*?pkey\s*:\s*"([^"]+)"/i);
     const pkey = playInfoMatch ? playInfoMatch[1] : "";
 
+    // 播放器 iframe 需要 ref=/movie/xxx.html 这种站内路径
+    let refPath = "";
+    try {
+      refPath = new URL(finalDetailUrl).pathname;
+    } catch {
+      refPath = `/movie/${videoId}.html`;
+    }
+
     const episodes = [];
     $("a.multilink-btn[data-vid]").each((_, el) => {
       const btn = $(el);
@@ -264,7 +290,7 @@ async function detail(params, context) {
       if (!vid || !pkey) return;
       episodes.push({
         name,
-        playId: buildPlayId({ videoId, detailUrl: finalDetailUrl, vid, pkey, title }),
+        playId: buildPlayId({ videoId, detailUrl: finalDetailUrl, refPath, vid, pkey, title }),
       });
     });
 
@@ -275,13 +301,13 @@ async function detail(params, context) {
       if (vid && singlePkey) {
         episodes.push({
           name: "在线播放",
-          playId: buildPlayId({ videoId, detailUrl: finalDetailUrl, vid, pkey: singlePkey, title }),
+          playId: buildPlayId({ videoId, detailUrl: finalDetailUrl, refPath, vid, pkey: singlePkey, title }),
         });
       }
     }
 
     const vod = {
-      vod_id: videoId,
+      vod_id: rawVideoId,
       vod_name: title,
       vod_pic: pic,
       vod_content: content,
@@ -291,7 +317,7 @@ async function detail(params, context) {
       vod_play_sources: episodes.length ? [{ name: "NO视频", episodes }] : [],
     };
 
-    await logInfo(`detail ${videoId} episodes=${episodes.length}`);
+    await logInfo(`detail ${rawVideoId} episodes=${episodes.length} 请求=${tried} 耗时=${Date.now() - started}ms ${directUrl ? "路径直达" : "兼容旧ID"}`);
     return { list: [vod] };
   } catch (e) {
     await logError(`detail 异常: ${e.message}`);
@@ -332,31 +358,27 @@ async function search(params, context) {
 }
 
 async function play(params, context) {
+  const started = Date.now();
   try {
     const meta = parsePlayId(params.playId || "");
-    const vid = meta.vid || "";
-    const pkey = meta.pkey || "";
-    const detailUrl = meta.detailUrl || "";
-    if (!vid || !pkey) {
+    // 站点播放链路是三层：详情页 -> player 子域 iframe -> enc-vod 配置 + wasm 浏览器校验。
+    // 服务端 sniffVideo 对详情页和 iframe 实测都是 9~11 秒后失败（exit status 1），
+    // 白等一轮只会拖慢启播；而且播放器页单独作为顶层打开时 wasm 不写 vkey，根本不出流。
+    // 因此这里不再嗅探，直接把详情页交给客户端 webview，由站内播放器自己完成鉴权。
+    const detailUrl = meta.detailUrl || (meta.videoId ? `${HOST}/?p=${meta.videoId}` : "");
+    if (!detailUrl) {
+      await logError("play 缺少 detailUrl，无法构造播放页");
       return { urls: [], parse: 1 };
     }
-
-    const sniffUrl = detailUrl || `${HOST}/movie/${meta.videoId || ""}.html`;
-
-    await logInfo(`play vid=${vid} sniffUrl=${sniffUrl}`);
-
-    const sniffResult = await sniffNoVideoPlay(sniffUrl);
-    if (sniffResult) {
-      return sniffResult;
-    }
-
+    await logInfo(`play 直达 ${detailUrl} 耗时=${Date.now() - started}ms`);
     return {
-      urls: [{ name: meta.title || "NO视频", url: sniffUrl }],
+      urls: [{ name: meta.title || "NO视频", url: detailUrl }],
       parse: 1,
       header: {
-        Referer: sniffUrl,
-        "User-Agent": UA
-      }};
+        Referer: detailUrl,
+        "User-Agent": UA,
+      },
+    };
   } catch (e) {
     await logError(`play 异常: ${e.message}`);
     return { urls: [], parse: 1 };
