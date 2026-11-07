@@ -1,7 +1,7 @@
 // @name NO视频
-// @description NO视频 - https://www.novipnoad.us/ 海外剧集电影采集站（每集直达播放器）
+// @description NO视频 - https://www.novipnoad.us/ 海外剧集电影采集站（电影直链，剧集走站点页面）
 // @dependencies cheerio
-// @version 1.3.0
+// @version 1.3.1
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/NO视频.js
 
 const cheerio = require("cheerio");
@@ -420,25 +420,28 @@ async function play(params, context) {
       await logInfo(`play 回退详情页 耗时=${Date.now() - started}ms`);
       return pageResult(detailUrl, meta);
     }
-    if (mode === "page") {
-      await logInfo(`play 页面直达 ${detailUrl} 耗时=${Date.now() - started}ms`);
-      return pageResult(detailUrl, meta);
-    }
-    if (!meta.vid || !meta.pkey) {
-      await logError("play 缺少 vid/pkey，回退详情页");
-      return pageResult(detailUrl, meta);
+    // NOVIDEO_MODE=player：播放器 iframe 优先（仅适合会用 iframe 嵌套加载的 webview 端）
+    if (mode === "player" && meta.vid && meta.pkey) {
+      const pu = buildPlayerUrl(meta);
+      await logInfo(`play 播放器优先 vid=${meta.vid} 耗时=${Date.now() - started}ms url=${pu}`);
+      return {
+        urls: [
+          { name: meta.title || "NO视频", url: pu },
+          { name: "网页播放（详情页）", url: detailUrl },
+        ],
+        parse: 1,
+        header: { Referer: detailUrl, "User-Agent": UA },
+      };
     }
 
-    const playerUrl = buildPlayerUrl(meta);
-    await logInfo(`play 播放器直达 vid=${meta.vid} 耗时=${Date.now() - started}ms url=${playerUrl}`);
-    return {
-      urls: [
-        { name: meta.title || "NO视频", url: playerUrl },
-        { name: "网页播放（详情页）", url: detailUrl },
-      ],
-      parse: 1,
-      header: { Referer: detailUrl, "User-Agent": UA },
-    };
+    // 剧集：站点详情页是唯一官方播放入口（客户端 webview 里可点分集）。
+    // 网页端播放器(ArtPlayer/hls.js)只认直链，parse=1 的页面 URL 不会出画面，
+    // 这一点已在宿主前端 player-*.js 里确认，故这里不再伪装成能播。
+    const playerUrl = meta.vid && meta.pkey ? buildPlayerUrl(meta) : "";
+    const urls = [{ name: meta.title || "NO视频", url: detailUrl }];
+    if (playerUrl) urls.push({ name: "播放器（iframe）", url: playerUrl });
+    await logInfo(`play 页面直达 ${detailUrl} 耗时=${Date.now() - started}ms 线路=${urls.length}（剧集直链需站点同源上下文，网页端暂不可得）`);
+    return { urls, parse: 1, header: { Referer: detailUrl, "User-Agent": UA } };
   } catch (e) {
     await logError(`play 异常: ${e.message}`);
     return { urls: [], parse: 1 };
