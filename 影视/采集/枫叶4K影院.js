@@ -1,7 +1,7 @@
 // @name 枫叶4K影院
 // @description 枫叶4K影院 - https://www.zzztool.com/ 聚合鹅酷爱芒桃的4K影视站（MacCMS AJAX 列表 + player_aaaa 直链/解析）
 // @dependencies cheerio
-// @version 1.0.2
+// @version 1.0.3
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶4K影院.js
 
 const cheerio = require("cheerio");
@@ -274,6 +274,10 @@ async function detail(params, context) {
       sources.push({ name: tabNames[idx] || `线路${idx + 1}`, episodes });
     });
 
+    // 自营线路（自营t/y/r）是 m3u8 直链、秒开；蓝光2k/至臻4k 走第三方解析要 9~15s，
+    // 把直链排到前面，避免默认点第一条就卡在解析上。
+    sources.sort((a, b) => (/自营/.test(String(a.name)) ? 0 : 1) - (/自营/.test(String(b.name)) ? 0 : 1));
+
     const vod = {
       vod_id: videoId,
       vod_name: title,
@@ -475,22 +479,25 @@ async function getPlayerConfig() {
 }
 
 async function sniffDirect(targetUrl) {
-  if (!OmniBox.sniffVideo) return "";
+  if (!OmniBox.sniffVideo) return null;
   try {
     const started = Date.now();
     const sniffed = await OmniBox.sniffVideo(targetUrl, { "User-Agent": UA, Referer: HOST + "/" });
     if (sniffed && sniffed.url) {
       await logInfo(`嗅探成功 耗时=${Date.now() - started}ms url=${String(sniffed.url).slice(0, 140)}`);
-      return sniffed.url;
+      return { url: sniffed.url, header: sniffed.header || null };
     }
     await logInfo(`嗅探无结果 耗时=${Date.now() - started}ms`);
   } catch (e) {
     await logInfo(`嗅探失败: ${e.message}`);
   }
-  return "";
+  return null;
 }
 
-const PLAY_HEADER = { Referer: HOST + "/", "User-Agent": UA };
+// 不要带站点 Referer：实测 svip.ryiplay18.com 带 Referer 会直接 SSL 断连（code=000），
+// 不带 Referer 反而 200；dytt-tvs / yzzy 两条线有没有 Referer 都正常。
+// 解析线路优先用嗅探器抓到的真实请求头。
+const PLAY_HEADER = { "User-Agent": UA };
 
 async function play(params, context) {
   const started = Date.now();
@@ -538,9 +545,13 @@ async function play(params, context) {
         await logInfo(`play 预热跳过嗅探 sid=${sid} nid=${nid}`);
         return { urls: [{ name: entry.show || "解析", url: parseUrl }], parse: 1, header: PLAY_HEADER };
       }
-      const direct = await sniffDirect(parseUrl);
-      if (direct) {
-        return { urls: [{ name: entry.show || "解析", url: direct }], parse: 0, header: PLAY_HEADER };
+      const sniffed = await sniffDirect(parseUrl);
+      if (sniffed) {
+        return {
+          urls: [{ name: entry.show || "解析", url: sniffed.url }],
+          parse: 0,
+          header: { ...PLAY_HEADER, ...(sniffed.header || {}) },
+        };
       }
       await logInfo(`play 解析回退 sid=${sid} 耗时=${Date.now() - started}ms`);
       return { urls: [{ name: entry.show || "解析", url: parseUrl }], parse: 1, header: PLAY_HEADER };
