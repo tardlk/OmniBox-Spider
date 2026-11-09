@@ -1,8 +1,8 @@
 // @name Auete影视
 // @author 梦
-// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页；封面默认直连，失效图床（如 502 的 dyttimage）与站点占位符自动剔除（AU_IMG_PROXY=off|wsrv|server|site）
+// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页；失效图床的封面自动用豆瓣海报补齐（经站点 img.php 代理），AU_DOUBAN_COVER=0 可关；封面默认直连（AU_IMG_PROXY=off|wsrv|server|site）
 // @dependencies cheerio
-// @version 2.2.1
+// @version 2.3.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/Auete影视.js
 
 const OmniBox = require("omnibox_sdk");
@@ -337,7 +337,7 @@ async function searchViaSite(keyword) {
       );
       if (!/系统安全验证|搜索限制/.test(html)) {
         await cachePut(TS_KEY, Date.now(), 600);
-        const list = parseCards(html);
+        const list = await fillCovers(parseCards(html));
         await logInfo(`search 已验证会话直取 keyword=${keyword} list=${list.length}`);
         return list;
       }
@@ -360,7 +360,7 @@ async function searchViaSite(keyword) {
   }
   if (solved.session) await cachePut(SESS_KEY, solved.session, SESS_TTL);
   await cachePut(TS_KEY, Date.now(), 600);
-  const list = parseCards(String(solved.html || ""));
+  const list = await fillCovers(parseCards(String(solved.html || "")));
   await logInfo(`search 验证码已解 ${solved.answer || ""} 耗时=${solved.cost || 0}ms keyword=${keyword} list=${list.length}`);
   return list;
 }
@@ -422,7 +422,89 @@ function serverProxy(url) {
 
 // 站点自己的脏数据：模板未渲染的 ${r.cover}、懒加载占位、以及已经 502 的图床
 const IMG_JUNK = /(\$\{|\{r\.cover\}|loading\.gif|statics\/picture\/logo)/i;
-const IMG_DEAD_HOST = /(vod\.dyttimage\.com)/i;
+const IMG_DEAD_HOST = /(vod\.dyttimage\.com|vvmp4\.com)/i; // dyttimage 整站 502；vvmp4 大量超时/404，干脆交给豆瓣补
+
+// ===== 封面补全（豆瓣） =====
+// 站点有不少老片封面挂在已 502 的图床上（vod.dyttimage.com 等），原站自己也是裂图。
+// 这类没有可救的原始地址，改用豆瓣的条目海报：豆瓣搜索接口返回 img（doubanio 直连 418），
+// 所以再套一层站点自带的 img.php 代理（实测 jpg 海报稳定 27KB，webp 会被代理截断成 168B，
+// 需要把 .webp 换成 .jpg 并固定到 img1 分片）。
+const DOUBAN_COVER = String(process.env.AU_DOUBAN_COVER || "1") !== "0";
+const DOUBAN_MAX = Math.max(0, Number(process.env.AU_DOUBAN_MAX || 6));
+const DOUBAN_TTL = 7 * 24 * 3600;
+
+function doubanQueryName(name) {
+  return String(name || "")
+    .replace(/[（(][^）)]*[）)]/g, " ")
+    .replace(/\s*\/\s*.*$/, " ") // 站点标题常写成「中文名 / English」
+    .replace(/第[0-9０-９一二三四五六七八九十百]+[季部集期]/g, " ")
+    .replace(/[·・:：].*$/, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// 豆瓣 suggest 是匿名接口，短时间十几连击会返回空数组（约 1 分钟恢复）。
+// 命中一次「全部查不到」就进入冷却，避免继续硬打把自己封掉。
+const DOUBAN_COOL_KEY = "auete:db:cool:v1";
+
+async function doubanPoster(name) {
+  if (await cacheGet(DOUBAN_COOL_KEY)) return "";
+  const key = `auete:db:v3:${name}`;
+  const cached = await cacheGet(key);
+  if (cached !== null && cached !== undefined && cached !== "") return String(cached);
+  if (cached === "") return "";
+  const queries = [name, doubanQueryName(name)].filter((v, i, a) => v && a.indexOf(v) === i);
+  for (const q of queries) {
+    try {
+      const res = await OmniBox.request(
+        `https://movie.douban.com/j/subject_suggest?q=${encodeURIComponent(q)}`,
+        { method: "GET", headers: { "User-Agent": UA, Referer: "https://movie.douban.com/" } }
+      );
+      if (Number(res && res.statusCode) !== 200) continue;
+      const arr = JSON.parse(String((res && res.body) || "[]"));
+      if (!Array.isArray(arr) || !arr.length) continue;
+      const hit =
+        arr.find((x) => String(x.title || "") === name) ||
+        arr.find((x) => x.title && (name.includes(String(x.title)) || String(x.title).includes(name))) ||
+        arr[0];
+      const img = String((hit && hit.img) || "");
+      if (!img) continue;
+      // 直连 doubanio 一律 418，必须走站点 img.php；webp 海报代理会截断，换 jpg 分片
+      const fixed = img
+        .replace(/\.webp$/i, ".jpg")
+        .replace(/^https?:\/\/img\d\.doubanio\.com/i, "https://img1.doubanio.com");
+      const url = `${HOST}/img.php?url=${encodeURIComponent(fixed)}`;
+      await cachePut(key, url, DOUBAN_TTL);
+      return url;
+    } catch (_) {
+      /* 换下一个查询词 */
+    }
+  }
+  await cachePut(key, "", 86400); // 负缓存，别每次都去问豆瓣
+  return "";
+}
+
+// 只给「取不到封面」的条目补，且每次最多补 DOUBAN_MAX 个，避免拖慢列表
+async function fillCovers(list) {
+  if (!DOUBAN_COVER || !DOUBAN_MAX) return list;
+  const targets = list.filter((it) => it && !it.vod_pic).slice(0, DOUBAN_MAX);
+  if (!targets.length) return list;
+  await Promise.all(
+    targets.map(async (it, idx) => {
+      await sleep(idx * 150); // 稍微错开，别一瞬间打一堆
+      const pic = await doubanPoster(it.vod_name);
+      if (pic) it.vod_pic = pic;
+    })
+  );
+  const filled = targets.filter((it) => it.vod_pic).length;
+  if (filled) await logInfo(`封面补全 ${filled}/${targets.length}（豆瓣）`);
+  // 一批里一个都没查到（≥3 个时）基本是接口限流，先冷静 90 秒
+  if (!filled && targets.length >= 3) {
+    await cachePut(DOUBAN_COOL_KEY, "1", 90);
+    await logInfo("封面补全：豆瓣疑似限流，暂停 90 秒");
+  }
+  return list;
+}
 
 function finalizeImage(raw) {
   const abs = absUrl(raw);
@@ -552,7 +634,7 @@ async function home(params, context) {
   setImgBase(context);
   try {
     const html = await requestHtml("/index.html");
-    const list = parseCards(html).slice(0, 40);
+    const list = await fillCovers(parseCards(html).slice(0, 40));
     await logInfo(`home list=${list.length}`);
     return { class: CLASS_LIST.map((c) => ({ type_id: c.type_id, type_name: c.type_name })), list };
   } catch (error) {
@@ -568,7 +650,7 @@ async function category(params, context) {
   try {
     const url = buildCategoryUrl(typeId, page);
     const html = await requestHtml(url, absUrl(buildCategoryUrl(typeId, 1)));
-    const list = parseCards(html);
+    const list = await fillCovers(parseCards(html));
     const pagecount = parsePageCount(html);
     await logInfo(`category ${typeId} page=${page}/${pagecount} list=${list.length}`);
     return { page, pagecount, total: pagecount * PAGE_SIZE_HINT, list };
@@ -637,6 +719,7 @@ async function detail(params, context) {
   try {
     const html = await requestHtml(pageUrl);
     const vod = parseDetail(html, pageUrl);
+    if (!vod.vod_pic) await fillCovers([vod]);
     if (!vod.vod_name) {
       await logInfo(`detail ${vodId} 解析为空`);
       return { list: [] };
