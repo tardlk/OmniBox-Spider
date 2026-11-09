@@ -1,8 +1,8 @@
 // @name Auete影视
 // @author 梦
-// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页；百度图床封面走 OmniBox 服务端图片代理（AU_IMG_PROXY=auto|server|wsrv|site|off）
+// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页；封面默认直连，失效图床（如 502 的 dyttimage）与站点占位符自动剔除（AU_IMG_PROXY=off|wsrv|server|site）
 // @dependencies cheerio
-// @version 2.2.0
+// @version 2.2.1
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/Auete影视.js
 
 const OmniBox = require("omnibox_sdk");
@@ -385,7 +385,7 @@ function absUrl(path = "") {
 // - pic.rmb.bdstatic.com 在部分网络下完全打不开（站点自己也会 fallback 到 loading.gif）
 // 所以默认把这类封面转给 wsrv.nl 图片代理（它去取原图再回传，绕开防盗链与线路问题）。
 // AU_IMG_PROXY=auto（默认）| wsrv | site | off
-const IMG_PROXY = String(process.env.AU_IMG_PROXY || "auto").trim().toLowerCase();
+const IMG_PROXY = String(process.env.AU_IMG_PROXY || "off").trim().toLowerCase();
 const IMG_BAIDU = /(bdstatic\.com|(^|\.)baidu\.com)/i;
 // OmniBox 自带服务端图片代理：由 NAS 拉图再回给客户端，客户端网络再差也能显示
 let IMG_BASE = "";
@@ -410,7 +410,8 @@ function unwrapImgProxy(url = "") {
 }
 
 function toWsrv(url) {
-  return `https://wsrv.nl/?url=${encodeURIComponent(url)}`;
+  // output=jpg 是为了兼容不认 webp 的播放端，w=320 顺带把体积压下来
+  return `https://wsrv.nl/?url=${encodeURIComponent(url)}&w=320&output=jpg&q=80`;
 }
 
 // 服务端代理：/api/proxy/image?url=<原图>，由 OmniBox 自己把图拉回来
@@ -419,9 +420,14 @@ function serverProxy(url) {
   return `${IMG_BASE}/api/proxy/image?url=${encodeURIComponent(url)}`;
 }
 
+// 站点自己的脏数据：模板未渲染的 ${r.cover}、懒加载占位、以及已经 502 的图床
+const IMG_JUNK = /(\$\{|\{r\.cover\}|loading\.gif|statics\/picture\/logo)/i;
+const IMG_DEAD_HOST = /(vod\.dyttimage\.com)/i;
+
 function finalizeImage(raw) {
   const abs = absUrl(raw);
   if (!abs) return "";
+  if (IMG_JUNK.test(abs) || IMG_DEAD_HOST.test(abs)) return ""; // 宁可留空让客户端显示默认图
   if (IMG_PROXY === "off") return abs;
   const inner = unwrapImgProxy(abs);
   const target = inner || abs;
