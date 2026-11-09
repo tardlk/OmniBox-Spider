@@ -1,13 +1,17 @@
 // @name 4kav影院
 // @author 梦
-// @description 站点 4k-av.com（4K 高清影视，画质优先、条目少而精）：支持首页、分类、搜索、详情与直链播放；站点有 Cloudflare 风控，请求节流 1.2s + 页面缓存；封面可用 KMP_IMG_PROXY=server/wsrv 加速
+// @description 站点 4k-av.com（4K 高清影视，画质优先、条目少而精）：支持首页、分类、搜索、详情与直链播放；CF 风控下用「节流+缓存+浏览器兜底（Playwright）」三层策略，/s 被拦时自动用真浏览器过挑战；封面可用 KMP_IMG_PROXY=server/wsrv 加速
 // @dependencies cheerio
-// @version 1.1.1
+// @version 1.2.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4kav影院.js
 
 const OmniBox = require("omnibox_sdk");
 const runner = require("spider_runner");
 const cheerio = require("cheerio");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { execFileSync } = require("child_process");
 
 const BASE_URL = "https://4k-av.com";
 // 参考 GitHub 上能跑通的 4K-AV TVBox 爬虫（default7869/jaychouqq 的 4K影视_2.py）：
@@ -34,6 +38,141 @@ let searchBlockedUntil = 0;
 const pageCache = new Map();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ============ 浏览器兜底（OmniBox 自带 Playwright/Chromium） ============
+// SDK 没暴露「渲染页面」的方法，但脚本能 require('child_process')，
+// 容器里就有 python3 + playwright，所以可以自己起一个真浏览器：
+//   - /s 搜索被 Cloudflare 拦时，用浏览器过 JS 挑战再取 HTML
+//   - 顺手把 cf_clearance 存下来，之后普通 HTTP 请求带着它走同一出口/同一 UA
+// 代价是每次调用 3~6 秒（浏览器冷启动），所以只在普通请求失败时才用。
+const BROWSER_HELPER = path.join(os.tmpdir(), "ob_kmp_browser.py");
+const BROWSER_PROFILE = path.join(os.tmpdir(), "ob_kmp_profile");
+const CF_CACHE_KEY = "kmp:cf:v1";
+
+const BROWSER_HELPER_SRC = `# -*- coding: utf-8 -*-
+import asyncio, json, sys
+from playwright.async_api import async_playwright
+
+PROFILE = ${JSON.stringify(BROWSER_PROFILE)}
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+
+async def main():
+    cfg = json.loads(sys.argv[1])
+    url = cfg["url"]
+    wait_ms = int(cfg.get("wait_ms", 4000))
+    timeout_ms = int(cfg.get("timeout_ms", 45000))
+    async with async_playwright() as p:
+        ctx = await p.chromium.launch_persistent_context(
+            PROFILE, headless=True, user_agent=UA,
+            viewport={"width": 1440, "height": 900}, locale="zh-CN",
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        out = {"status": 0, "html": "", "title": "", "cookies": {}}
+        try:
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            out["status"] = resp.status if resp else 0
+            await asyncio.sleep(wait_ms / 1000.0)
+            out["title"] = (await page.title())[:120]
+            out["html"] = await page.content()
+            for c in await ctx.cookies():
+                if c.get("name"):
+                    out["cookies"][c["name"]] = c["value"]
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        finally:
+            await ctx.close()
+        print(json.dumps(out, ensure_ascii=False))
+
+asyncio.run(main())
+`;
+
+function ensureBrowserHelper() {
+  try {
+    if (!fs.existsSync(BROWSER_HELPER)) fs.writeFileSync(BROWSER_HELPER, BROWSER_HELPER_SRC, "utf8");
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+let cfCookieMem = "";
+
+async function getCfCookie() {
+  if (cfCookieMem) return cfCookieMem;
+  try {
+    const raw = await OmniBox.getCache(CF_CACHE_KEY);
+    if (raw) cfCookieMem = String(raw);
+  } catch (_) {
+    /* 忽略缓存异常 */
+  }
+  return cfCookieMem;
+}
+
+async function rememberCfCookie(cookies) {
+  const parts = [];
+  const cf = cookies && cookies.cf_clearance;
+  if (cf) parts.push(`cf_clearance=${cf}`);
+  if (cookies && cookies.langID) parts.push(`langID=${cookies.langID}`);
+  if (!parts.length) return;
+  cfCookieMem = parts.join("; ");
+  try {
+    await OmniBox.setCache(CF_CACHE_KEY, cfCookieMem, 1800);
+  } catch (_) {
+    /* 写缓存失败不影响 */
+  }
+}
+
+// 真浏览器取页面，返回 { status, title, html, cookies }
+async function browserFetch(url, { waitMs = 4000, timeoutMs = 45000 } = {}) {
+  const started = Date.now();
+  try {
+    // 浏览器冷启动 6~10 秒，本机 IP 被 CF 硬封时它也一样 403；
+    // 失败过一次就静默 15 分钟，别让每次搜索/播放都白等
+    try {
+      if (await OmniBox.getCache("kmp:boff:v1")) return null;
+    } catch (_) {
+      /* 缓存不可用就继续 */
+    }
+    if (!ensureBrowserHelper()) {
+      await OmniBox.log("warn", "[4KMP][browser] 写不了 helper 脚本，跳过浏览器兜底");
+      return null;
+    }
+    const stdout = execFileSync(
+      "python3",
+      [BROWSER_HELPER, JSON.stringify({ url, wait_ms: waitMs, timeout_ms: timeoutMs })],
+      { encoding: "utf8", timeout: timeoutMs + 20000, maxBuffer: 32 * 1024 * 1024 }
+    );
+    const line = String(stdout || "").trim().split("\n").filter(Boolean).pop() || "{}";
+    const data = JSON.parse(line);
+    if (data.error) {
+      await OmniBox.log("warn", `[4KMP][browser] ${data.error} 耗时=${Date.now() - started}ms`);
+      return null;
+    }
+    await rememberCfCookie(data.cookies || {});
+    const blocked = /Attention Required|you have been blocked/i.test(String(data.html || ""));
+    await OmniBox.log(
+      "info",
+      `[4KMP][browser] status=${data.status} blocked=${blocked} len=${String(data.html || "").length} 耗时=${Date.now() - started}ms`
+    );
+    if (!data.status || data.status >= 400 || blocked) {
+      try {
+        await OmniBox.setCache("kmp:boff:v1", "1", 900);
+      } catch (_) {
+        /* 忽略 */
+      }
+    }
+    return data;
+  } catch (error) {
+    await OmniBox.log("warn", `[4KMP][browser] 失败: ${error.message}`);
+    try {
+      await OmniBox.setCache("kmp:boff:v1", "1", 900);
+    } catch (_) {
+      /* 忽略 */
+    }
+    return null;
+  }
+}
 
 async function throttle() {
   const wait = REQUEST_MIN_GAP - (Date.now() - lastRequestAt);
@@ -219,9 +358,12 @@ async function fetchText(url, options = {}) {
     if (attempt > 0) await sleep(1200 * attempt);
     await throttle();
     await OmniBox.log("info", `[4KMP][request] ${finalUrl}`);
+    const cf = await getCfCookie();
+    const extraHeaders = { ...(options.headers || {}) };
+    if (cf && !extraHeaders.Cookie && !COOKIE) extraHeaders.Cookie = cf;
     const res = await OmniBox.request(finalUrl, {
       method: options.method || "GET",
-      headers: buildHeaders(options.referer, options.headers || {}),
+      headers: buildHeaders(options.referer, extraHeaders),
       body: options.body,
       timeout: options.timeout || REQUEST_TIMEOUT,
     });
@@ -721,6 +863,16 @@ async function search(params, context) {
 
     // 2) 兜底：本地扫列表页匹配片名，结果落缓存并做分页
     const all = await scanSearch(keyword, context);
+
+    // 3) 列表页也扫不到时，用真浏览器过 CF 挑战直接取搜索页
+    if (!all.length && page === 1) {
+      const rendered = await browserFetch(`${BASE_URL}/s?k=${encodeURIComponent(keyword)}`, { waitMs: 3500 });
+      if (rendered && rendered.html && !/Attention Required|you have been blocked/i.test(rendered.html)) {
+        const list = refineSearchResults(parseVodList(rendered.html, undefined, context), keyword);
+        await OmniBox.log("info", `[4KMP][search] 浏览器兜底 keyword=${keyword} list=${list.length}`);
+        if (list.length) return { page: 1, pagecount: 1, total: list.length, list };
+      }
+    }
     const pagecount = Math.max(1, Math.ceil(all.length / SEARCH_PAGE_SIZE));
     const list = page > pagecount ? [] : all.slice((page - 1) * SEARCH_PAGE_SIZE, page * SEARCH_PAGE_SIZE);
     await OmniBox.log(
@@ -799,6 +951,26 @@ async function play(params, context) {
         urls: [{ name: `${meta.title || "播放页"}（仅下载，无在线流）`, url: pageUrl }],
         header: headers,
         headers};
+    }
+
+    // 普通请求没拿到 <source>（常见于 CF 只对浏览器放行）时，用真浏览器再取一次页面，
+    // 拿到 HTML 后按同样的选择器解析，比 sniffVideo 空等 15 秒更值
+    const rendered = await browserFetch(pageUrl, { waitMs: 3500 });
+    if (rendered && rendered.html) {
+      const $b = cheerio.load(rendered.html, { decodeEntities: false });
+      const browserSources = parseMediaSources($b, pageUrl);
+      const browserUrl = browserSources[0]?.url || "";
+      if (browserUrl) {
+        const playHeaders = buildPlayHeaders(pageUrl);
+        await OmniBox.log("info", `[4KMP][play] 浏览器取到直链 ${browserUrl.slice(0, 120)}`);
+        return {
+          parse: 0,
+          jx: 0,
+          url: browserUrl,
+          urls: browserSources.map((item) => ({ name: item.name, url: item.url })),
+          header: playHeaders,
+          headers: playHeaders};
+      }
     }
 
     if (typeof OmniBox.sniffVideo === "function") {
