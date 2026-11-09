@@ -1,7 +1,7 @@
 // @name 枫叶4K影院
 // @description 枫叶4K影院 - https://www.zzztool.com/ 聚合鹅酷爱芒桃的4K影视站（MacCMS AJAX 列表 + player_aaaa 直链/解析）
 // @dependencies cheerio
-// @version 1.0.4
+// @version 1.0.5
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶4K影院.js
 
 const cheerio = require("cheerio");
@@ -277,6 +277,15 @@ async function detail(params, context) {
     // 自营线路（自营t/y/r）是 m3u8 直链、秒开；蓝光2k/至臻4k 走第三方解析要 9~15s，
     // 把直链排到前面，避免默认点第一条就卡在解析上。
     sources.sort((a, b) => (/自营/.test(String(a.name)) ? 0 : 1) - (/自营/.test(String(b.name)) ? 0 : 1));
+
+    // 站点详情页本身就有同名线路：《灵武大陆》两个标签都叫「蓝光2k」
+    // （sid=8 共 232 集 / sid=9 共 220 集），直接透出客户端会显示两条一样的线路。
+    // 同名时补集数区分，既避免重复又提示哪条更全。
+    const nameCount = {};
+    for (const s of sources) nameCount[s.name] = (nameCount[s.name] || 0) + 1;
+    for (const s of sources) {
+      if (nameCount[s.name] > 1) s.name = `${s.name}（${s.episodes.length}集）`;
+    }
 
     const vod = {
       vod_id: videoId,
