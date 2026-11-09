@@ -1,7 +1,7 @@
 // @name 枫叶4K影院
 // @description 枫叶4K影院 - https://www.zzztool.com/ 聚合鹅酷爱芒桃的4K影视站（MacCMS AJAX 列表 + player_aaaa 直链/解析）
 // @dependencies cheerio
-// @version 1.0.0
+// @version 1.0.1
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶4K影院.js
 
 const cheerio = require("cheerio");
@@ -13,6 +13,9 @@ runner.run(module.exports);
 
 const HOST = (process.env.ZZZ_HOST || "https://www.zzztool.com").replace(/\/+$/, "");
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36";
+// 站点对 /type 与 /search 要图形验证码；在浏览器里手动过一次后，
+// 把 Cookie 整串填到环境变量 ZZZ_COOKIE，即可启用真正的站内搜索。
+const COOKIE = String(process.env.ZZZ_COOKIE || "").trim();
 const API_LIST = `${HOST}/index.php/ajax/data`;
 const PAGE_SIZE = 30; // 站点 ajax 接口上限为 30，超过会异常返回 10 条
 const CFG_CACHE_KEY = "zzz:playercfg:v1";
@@ -92,15 +95,18 @@ function unwrapBody(raw) {
   return body;
 }
 
+function isVerifyPage(html) {
+  return /系统安全验证|访问此数据需要输入验证码/.test(String(html || ""));
+}
+
 async function httpGet(url, referer = HOST + "/") {
-  const res = await OmniBox.request(url, {
-    method: "GET",
-    headers: {
-      "User-Agent": UA,
-      Referer: referer,
-      Accept: "text/html,application/json,*/*",
-    },
-  });
+  const headers = {
+    "User-Agent": UA,
+    Referer: referer,
+    Accept: "text/html,application/json,*/*",
+  };
+  if (COOKIE) headers.Cookie = COOKIE;
+  const res = await OmniBox.request(url, { method: "GET", headers });
   if (res.statusCode !== 200) throw new Error(`HTTP ${res.statusCode}`);
   return unwrapBody(res.body);
 }
@@ -316,7 +322,7 @@ async function search(params, context) {
     const page = Math.max(1, Number(params.page) || 1);
     if (!keyword) return { page: 1, pagecount: 0, total: 0, list: [] };
 
-    const cacheKey = `zzz:search:v1:${keyword}`;
+    const cacheKey = `zzz:search:v2:${keyword}`;
     try {
       const cached = await OmniBox.getCache(cacheKey);
       if (cached) {
@@ -328,6 +334,30 @@ async function search(params, context) {
       }
     } catch (_) {
       /* 缓存不可用继续扫描 */
+    }
+
+    // 配置了 ZZZ_COOKIE（浏览器里手动过验证码后复制的整串 Cookie）时，直接用站内真搜索
+    if (COOKIE) {
+      try {
+        const searchUrl = `${HOST}/search/-------------.html?wd=${encodeURIComponent(keyword)}&submit=`;
+        const html = await httpGet(searchUrl);
+        if (!isVerifyPage(html)) {
+          const items = uniqueByVodId(parseLabelPage(html)).slice(0, 30);
+          await logInfo(`search "${keyword}" 站内搜索命中 ${items.length} 条`);
+          if (items.length) {
+            try {
+              await OmniBox.setCache(cacheKey, JSON.stringify(items), 600);
+            } catch (_) {
+              /* 写缓存失败不影响返回 */
+            }
+            return { page, pagecount: 1, total: items.length, list: items };
+          }
+        } else {
+          await logInfo("search 站内搜索仍命中验证页，请检查 ZZZ_COOKIE 是否过期");
+        }
+      } catch (e) {
+        await logInfo(`search 站内搜索失败: ${e.message}，回退本地匹配`);
+      }
     }
 
     const seen = new Set();
