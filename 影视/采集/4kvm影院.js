@@ -2,8 +2,8 @@
 // @author 
 // @description 站点 4kvm.net（4K 影视综合站，电影/剧集聚合、多线路）：支持首页、分类、搜索、详情与直链播放；play 用站点 wasm 签名直取（0.3~0.7s），嗅探仅作兜底
 // @dependencies: axios, cheerio
-// @version 1.3.2
-// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4KVM.js
+// @version 1.3.3
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4kvm影院.js
 
 /**
 * ============================================================================
