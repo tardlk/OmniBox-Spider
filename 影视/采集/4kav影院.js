@@ -2,7 +2,7 @@
 // @author 梦
 // @description 站点 4k-av.com（4K 高清影视，画质优先、条目少而精）：支持首页、分类、搜索、详情与直链播放；CF 风控下用「节流+缓存+浏览器兜底（Playwright）」三层策略，/s 被拦时自动用真浏览器过挑战；封面可用 KMP_IMG_PROXY=server/wsrv 加速
 // @dependencies cheerio
-// @version 1.2.0
+// @version 1.2.1
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4kav影院.js
 
 const OmniBox = require("omnibox_sdk");
@@ -61,6 +61,7 @@ async def main():
     url = cfg["url"]
     wait_ms = int(cfg.get("wait_ms", 4000))
     timeout_ms = int(cfg.get("timeout_ms", 45000))
+    warmup = cfg.get("warmup") or ""
     async with async_playwright() as p:
         ctx = await p.chromium.launch_persistent_context(
             PROFILE, headless=True, user_agent=UA,
@@ -70,6 +71,14 @@ async def main():
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         out = {"status": 0, "html": "", "title": "", "cookies": {}}
         try:
+            # 先访问一下首页再进目标页：CF 的评分常按会话累计，
+            # 直接冷启打开 /s 更容易被判成爬虫
+            if warmup:
+                try:
+                    await page.goto(warmup, wait_until="domcontentloaded", timeout=timeout_ms)
+                    await asyncio.sleep(1.5)
+                except Exception:
+                    pass
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             out["status"] = resp.status if resp else 0
             await asyncio.sleep(wait_ms / 1000.0)
@@ -124,13 +133,13 @@ async function rememberCfCookie(cookies) {
 }
 
 // 真浏览器取页面，返回 { status, title, html, cookies }
-async function browserFetch(url, { waitMs = 4000, timeoutMs = 45000 } = {}) {
+async function browserFetch(url, { waitMs = 4000, timeoutMs = 45000, warmup = "" } = {}) {
   const started = Date.now();
   try {
     // 浏览器冷启动 6~10 秒，本机 IP 被 CF 硬封时它也一样 403；
     // 失败过一次就静默 15 分钟，别让每次搜索/播放都白等
     try {
-      if (await OmniBox.getCache("kmp:boff:v1")) return null;
+      if (await OmniBox.getCache("kmp:boff:v2")) return null;
     } catch (_) {
       /* 缓存不可用就继续 */
     }
@@ -140,7 +149,7 @@ async function browserFetch(url, { waitMs = 4000, timeoutMs = 45000 } = {}) {
     }
     const stdout = execFileSync(
       "python3",
-      [BROWSER_HELPER, JSON.stringify({ url, wait_ms: waitMs, timeout_ms: timeoutMs })],
+      [BROWSER_HELPER, JSON.stringify({ url, wait_ms: waitMs, timeout_ms: timeoutMs, warmup })],
       { encoding: "utf8", timeout: timeoutMs + 20000, maxBuffer: 32 * 1024 * 1024 }
     );
     const line = String(stdout || "").trim().split("\n").filter(Boolean).pop() || "{}";
@@ -157,7 +166,7 @@ async function browserFetch(url, { waitMs = 4000, timeoutMs = 45000 } = {}) {
     );
     if (!data.status || data.status >= 400 || blocked) {
       try {
-        await OmniBox.setCache("kmp:boff:v1", "1", 900);
+        await OmniBox.setCache("kmp:boff:v2", "1", 900);
       } catch (_) {
         /* 忽略 */
       }
@@ -166,7 +175,7 @@ async function browserFetch(url, { waitMs = 4000, timeoutMs = 45000 } = {}) {
   } catch (error) {
     await OmniBox.log("warn", `[4KMP][browser] 失败: ${error.message}`);
     try {
-      await OmniBox.setCache("kmp:boff:v1", "1", 900);
+      await OmniBox.setCache("kmp:boff:v2", "1", 900);
     } catch (_) {
       /* 忽略 */
     }
@@ -866,7 +875,10 @@ async function search(params, context) {
 
     // 3) 列表页也扫不到时，用真浏览器过 CF 挑战直接取搜索页
     if (!all.length && page === 1) {
-      const rendered = await browserFetch(`${BASE_URL}/s?k=${encodeURIComponent(keyword)}`, { waitMs: 3500 });
+      const rendered = await browserFetch(`${BASE_URL}/s?k=${encodeURIComponent(keyword)}`, {
+        waitMs: 3500,
+        warmup: `${BASE_URL}/`,
+      });
       if (rendered && rendered.html && !/Attention Required|you have been blocked/i.test(rendered.html)) {
         const list = refineSearchResults(parseVodList(rendered.html, undefined, context), keyword);
         await OmniBox.log("info", `[4KMP][search] 浏览器兜底 keyword=${keyword} list=${list.length}`);
