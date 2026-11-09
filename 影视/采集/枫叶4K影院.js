@@ -1,7 +1,7 @@
 // @name 枫叶4K影院
 // @description 枫叶4K影院 - https://www.zzztool.com/ 聚合鹅酷爱芒桃的4K影视站（MacCMS AJAX 列表 + player_aaaa 直链/解析）
 // @dependencies cheerio
-// @version 1.0.6
+// @version 1.0.7
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶4K影院.js
 
 const cheerio = require("cheerio");
@@ -487,6 +487,59 @@ async function getPlayerConfig() {
   }
 }
 
+// 解析站自带取流接口（比 sniffVideo 快一个数量级）：
+//   GET  {origin}/player/?url=<co_xxx|JD-xxx>  → 页面里下发 data-u / data-te
+//   POST {origin}/player/mplayer.php  url=<data-u>&token=<data-te>
+//        → {"code":200,"url":"https://...m3u8","type":"hls"}
+// 实测 0.5s 出结果；token 可复用，但必须先带站点 Referer 打开解析页，
+// 否则返回空响应。注意解析页的 Referer 必须是 www.zzztool.com 的页面。
+async function resolveParseDirect(parseBase, target) {
+  const started = Date.now();
+  try {
+    const origin = new URL(parseBase).origin;
+    const pageUrl = `${origin}/player/?url=${encodeURIComponent(target)}`;
+    const html = await httpGet(pageUrl, `${HOST}/`);
+    if (!html) {
+      await logInfo("解析接口 页面为空（可能被 Referer 拦）");
+      return null;
+    }
+    const u = (html.match(/data-u="([^"]+)"/) || [])[1] || target;
+    const te = (html.match(/data-te="([^"]+)"/) || [])[1];
+    if (!te) {
+      await logInfo("解析接口 未取到 token");
+      return null;
+    }
+    const res = await OmniBox.request(`${origin}/player/mplayer.php`, {
+      method: "POST",
+      headers: {
+        "User-Agent": UA,
+        Referer: `${HOST}/`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+      body: `url=${encodeURIComponent(u)}&token=${encodeURIComponent(te)}`,
+    });
+    let json = {};
+    const rawBody = unwrapBody(res.body);
+    try {
+      json = JSON.parse(rawBody || "{}");
+    } catch (_) {
+      json = {};
+    }
+    if (Number(json.code) !== 200 || !json.url) {
+      await logInfo(
+        `解析接口失败 code=${json.code || res.statusCode} msg=${json.msg || ""} 耗时=${Date.now() - started}ms body=${String(rawBody || "").slice(0, 120)}`
+      );
+      return null;
+    }
+    await logInfo(`解析接口成功 ${Date.now() - started}ms ${String(json.url).slice(0, 110)}`);
+    return { url: String(json.url), header: null };
+  } catch (e) {
+    await logInfo(`解析接口异常: ${e.message}`);
+    return null;
+  }
+}
+
 async function sniffDirect(targetUrl) {
   if (!OmniBox.sniffVideo) return null;
   try {
@@ -719,7 +772,7 @@ async function play(params, context) {
           return { urls: alts.map((a) => ({ name: a.name, url: a.url })), parse: 0, header: PLAY_HEADER };
         }
       }
-      const sniffed = await sniffDirect(parseUrl);
+      const sniffed = (await resolveParseDirect(entry.parse, target)) || (await sniffDirect(parseUrl));
       if (sniffed) {
         const lineName = entry.show || "解析";
         const header = { ...PLAY_HEADER, ...(sniffed.header || {}) };
@@ -761,6 +814,12 @@ async function play(params, context) {
         return { urls: [{ name: `${lineName}（源缺失）`, url: sniffed.url }], parse: 0, header };
       }
       await logInfo(`play 解析回退 sid=${sid} 耗时=${Date.now() - started}ms`);
+      // 解析接口和嗅探都拿不到（解析站限流/被封时常见）：先给同集直链，
+      // 实在没有才回页面地址，避免客户端拿到一个空壳页面
+      const alts = await findAltDirects(videoId, nid, sid, 3);
+      if (alts.length) {
+        return { urls: alts.map((a) => ({ name: a.name, url: a.url })), parse: 0, header: PLAY_HEADER };
+      }
       return { urls: [{ name: entry.show || "解析", url: parseUrl }], parse: 1, header: PLAY_HEADER };
     }
 
