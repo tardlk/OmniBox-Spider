@@ -1,19 +1,34 @@
 // @name Auete影视
 // @author 梦
-// @description 刮削：不支持，弹幕：不支持，嗅探：不支持，支持站内直链播放
-// @version 1.0.3
+// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索需算术验证码，未过验证时自动改扫列表页
+// @dependencies cheerio
+// @version 2.0.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/Auete影视.js
 
 const OmniBox = require("omnibox_sdk");
 const runner = require("spider_runner");
+const cheerio = require("cheerio");
 
-const HOST = "https://auete.top";
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+// 旧域名 auete.top 现在只返回 Redirecting...，站点已迁到 au1080.top
+const HOST = (process.env.AU_HOST || "https://www.au1080.top").replace(/\/+$/, "");
+const UA = process.env.AU_UA || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+const PAGE_CACHE_TTL = 120;      // 列表/详情页缓存秒数
+const SEARCH_CACHE_TTL = 900;    // 本地扫描结果缓存秒数
+const SEARCH_SCAN_PAGES = Number(process.env.AU_SEARCH_PAGES || 2);
+const PAGE_SIZE_HINT = 20;
+
+const CLASS_LIST = [
+  { type_id: "Movie", type_name: "电影", path: "/Movie/" },
+  { type_id: "Tv", type_name: "电视剧", path: "/Tv/" },
+  { type_id: "Zy", type_name: "综艺", path: "/Zy/" },
+  { type_id: "Dm", type_name: "动漫", path: "/Dm/" },
+  { type_id: "qita", type_name: "其他", path: "/qita/" },
+];
+
 const BASE_HEADERS = {
   "User-Agent": UA,
-  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
   "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-  Referer: `${HOST}/`,
 };
 const PLAY_HEADERS = {
   "User-Agent": UA,
@@ -21,391 +36,344 @@ const PLAY_HEADERS = {
   Origin: HOST,
 };
 
-const CLASS_LIST = [
-  { type_id: "Movie", type_name: "电影" },
-  { type_id: "Tv", type_name: "电视剧" },
-  { type_id: "Zy", type_name: "综艺" },
-  { type_id: "Dm", type_name: "动漫" },
-  { type_id: "qita", type_name: "其他" },
-];
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const FILTERS = {
-  Movie: [
-    {
-      key: "cate",
-      name: "类型",
-      init: "",
-      value: [
-        { name: "全部", value: "" },
-        { name: "喜剧片", value: "xjp" },
-        { name: "动作片", value: "dzp" },
-        { name: "爱情片", value: "aqp" },
-        { name: "科幻片", value: "khp" },
-        { name: "恐怖片", value: "kbp" },
-        { name: "惊悚片", value: "jsp" },
-        { name: "战争片", value: "zzp" },
-        { name: "剧情片", value: "jqp" },
-      ],
-    },
-  ],
-};
-
-module.exports = { home, category, detail, search, play };
-runner.run(module.exports);
-
-function logInfo(message, data = null) {
-  const output = data ? `${message}: ${JSON.stringify(data)}` : message;
-  OmniBox.log("info", `[Auete影视] ${output}`);
+async function logInfo(message) {
+  await OmniBox.log("info", `[Auete影视] ${message}`);
 }
 
-function logError(message, error) {
-  OmniBox.log("error", `[Auete影视] ${message}: ${error?.message || error}`);
+function absUrl(path = "") {
+  const value = String(path || "").trim();
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("//")) return `https:${value}`;
+  return `${HOST}${value.startsWith("/") ? "" : "/"}${value}`;
 }
 
-function buildUrl(path) {
-  if (!path) return HOST;
-  if (/^https?:\/\//i.test(path)) return path;
-  return `${HOST}${path.startsWith("/") ? path : `/${path}`}`;
-}
-
-function cleanText(text) {
+function cleanText(text = "") {
   return String(text || "")
     .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function decodeHtml(text) {
-  return String(text || "")
-    .replace(/&quot;/g, '"')
-    .replace(/&#34;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
+function decodeHtml(text = "") {
+  return cleanText(
+    String(text || "")
+      .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+      .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+      .replace(/&quot;/g, '"')
+      .replace(/&#039;|&apos;/g, "'")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+  );
 }
 
-async function requestHtml(url, extraHeaders = {}) {
-  const finalUrl = buildUrl(url);
-  logInfo("请求页面", { url: finalUrl });
-  const response = await OmniBox.request(finalUrl, {
-    method: "GET",
-    headers: { ...BASE_HEADERS, ...extraHeaders },
-  });
-  if (response.statusCode !== 200) {
-    throw new Error(`HTTP ${response.statusCode}`);
+async function requestHtml(url, referer = `${HOST}/`, useCache = true, depth = 0) {
+  const finalUrl = absUrl(url);
+  const cacheKey = `auete:page:${finalUrl}`;
+  if (useCache) {
+    try {
+      const cached = await OmniBox.getCache(cacheKey);
+      if (cached) return String(cached);
+    } catch (_) {
+      /* 缓存不可用则直连 */
+    }
   }
-  return response.body || "";
+  const res = await OmniBox.request(finalUrl, {
+    method: "GET",
+    headers: { ...BASE_HEADERS, Referer: referer },
+  });
+  const status = Number(res && res.statusCode);
+  // 站点对 / 会 302 到 /index.html，而 SDK 不自动跟随跳转
+  if (status >= 300 && status < 400) {
+    const location = (res.headers && (res.headers.location || res.headers.Location)) || "";
+    if (location && depth < 3) return requestHtml(absUrl(location), referer, useCache, depth + 1);
+    throw new Error(`HTTP ${status} 跳转无 location @ ${url}`);
+  }
+  if (status !== 200) throw new Error(`HTTP ${status} @ ${url}`);
+  const body = String((res && res.body) || "");
+  if (useCache) {
+    try {
+      await OmniBox.setCache(cacheKey, body, PAGE_CACHE_TTL);
+    } catch (_) {
+      /* 写缓存失败不影响 */
+    }
+  }
+  return body;
 }
 
-function normalizePic(url) {
-  const pic = String(url || "").trim();
-  if (!pic) return "";
-  if (/^https?:\/\//i.test(pic)) return pic;
-  if (pic.startsWith("//")) return `https:${pic}`;
-  return buildUrl(pic);
+function getTypeId(path) {
+  const m = String(path || "").match(/\/(Movie|Tv|Zy|Dm|qita)\//i);
+  return m ? m[1] : "";
 }
 
-function getClassName(typeId) {
-  return CLASS_LIST.find((item) => item.type_id === typeId)?.type_name || typeId;
+function getTypeName(typeId) {
+  return (CLASS_LIST.find((c) => c.type_id === typeId) || {}).type_name || "";
 }
 
-function parseListItems(html, fallbackTypeId = "") {
+// 列表卡片：<li data-href="/Movie/xxx/"><a class="pic"><img ...><span class="hdtag">HD</span></a><h2><a>片名</a></h2>
+function parseCards(html) {
+  const $ = cheerio.load(html || "", { decodeEntities: false });
   const list = [];
-  const regex = /<li[^>]*class="[^"]*trans_3[^"]*"[^>]*>[\s\S]*?<a\s+href="([^"]+)"\s+class="pic"[\s\S]*?<img\s+src="([^"]+)"[^>]*alt="([^"]*)"[\s\S]*?<button\s+class="hdtag">([\s\S]*?)<\/button>[\s\S]*?<h2\s+class="title">[\s\S]*?<a[^>]*title="([^"]*)"[\s\S]*?<div\s+class="date_hits">[\s\S]*?<span\s+class="float-right">[\s\S]*?<\/i>\s*([\s\S]*?)<\/span>/gi;
-  let match;
-  while ((match = regex.exec(html))) {
-    const detailPath = match[1];
-    const pic = normalizePic(match[2]);
-    const altName = cleanText(match[3]);
-    const remarks = cleanText(match[4]);
-    const titleName = cleanText(match[5]) || altName;
-    const score = cleanText(match[6]);
-    const typeId = getTypeIdFromPath(detailPath) || fallbackTypeId;
+  const seen = new Set();
+  $("li[data-href]").each((_, el) => {
+    const $el = $(el);
+    const href = String($el.attr("data-href") || $el.find("h2 a[href]").first().attr("href") || "").trim();
+    if (!href || !/\/(Movie|Tv|Zy|Dm|qita)\//i.test(href)) return;
+    const vodId = absUrl(href);
+    if (seen.has(vodId)) return;
+    const name = decodeHtml(
+      $el.find("h2 a").first().attr("title") || $el.find("h2 a").first().text() || $el.find("img").first().attr("alt")
+    );
+    if (!name) return;
+    seen.add(vodId);
+    const pic = absUrl($el.find("a.pic img, img").first().attr("src") || "");
+    const remarks = decodeHtml($el.find(".hdtag").first().text());
+    const score = cleanText($el.find(".rating").first().text()).replace(/分$/, "");
+    const typeId = getTypeId(href);
     list.push({
-      vod_id: detailPath,
-      vod_name: titleName || altName,
+      vod_id: vodId,
+      vod_name: name,
       vod_pic: pic,
-      vod_remarks: remarks || score,
+      vod_remarks: remarks || (score ? `${score}分` : ""),
       vod_douban_score: score,
       type_id: typeId,
-      type_name: getClassName(typeId),
+      type_name: getTypeName(typeId),
     });
-  }
-  return dedupeByVodId(list);
-}
-
-function dedupeByVodId(list) {
-  const seen = new Set();
-  return (list || []).filter((item) => {
-    const key = item?.vod_id;
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
   });
+  return list;
 }
 
-function getTypeIdFromPath(path) {
-  const match = String(path || "").match(/^\/(Movie|Tv|Zy|Dm|qita)\//i);
-  return match ? match[1] : "";
+function parsePageCount(html) {
+  const m = String(html || "").match(/共\s*(\d+)\s*页/);
+  return m ? Math.max(1, Number(m[1])) : 1;
 }
 
-function buildCategoryUrl(typeId, page, extend = {}) {
-  const p = Number(page || 1);
-  const cate = String(extend?.cate || "").trim();
-  const prefix = cate ? `/${typeId}/${cate}` : `/${typeId}`;
-  if (p <= 1) return `${prefix}/index.html`;
-  return `${prefix}/index${p}.html`;
-}
-
-function extractPageCount(html, typeId, cate = "") {
-  const prefix = cate ? `/${typeId}/${cate}/index` : `/${typeId}/index`;
-  const regex = new RegExp(`${prefix}(\\d+)\\.html`, "gi");
-  let maxPage = 1;
-  let match;
-  while ((match = regex.exec(html))) {
-    const p = parseInt(match[1], 10);
-    if (!Number.isNaN(p) && p > maxPage) maxPage = p;
-  }
-  return maxPage;
-}
-
-function encodePlayMeta(meta) {
-  return Buffer.from(JSON.stringify(meta || {}), "utf8").toString("base64");
-}
-
-function decodePlayMeta(str) {
-  try {
-    return JSON.parse(Buffer.from(String(str || ""), "base64").toString("utf8") || "{}");
-  } catch {
-    return {};
-  }
+function buildCategoryUrl(typeId, page) {
+  const cat = CLASS_LIST.find((c) => c.type_id === typeId) || CLASS_LIST[0];
+  return page <= 1 ? `${cat.path}index.html` : `${cat.path}index${page}.html`;
 }
 
 async function home(params, context) {
   try {
-    const html = await requestHtml("/");
-    const list = parseListItems(html);
-    logInfo("首页解析完成", { classCount: CLASS_LIST.length, listCount: list.length });
-    return {
-      class: CLASS_LIST.map((item) => ({ ...item })),
-      filters: FILTERS,
-      list,
-    };
+    const html = await requestHtml("/index.html");
+    const list = parseCards(html).slice(0, 40);
+    await logInfo(`home list=${list.length}`);
+    return { class: CLASS_LIST.map((c) => ({ type_id: c.type_id, type_name: c.type_name })), list };
   } catch (error) {
-    logError("home 失败", error);
-    return {
-      class: CLASS_LIST.map((item) => ({ ...item })),
-      filters: FILTERS,
-      list: [],
-    };
+    await logInfo(`home 失败: ${error.message}`);
+    return { class: CLASS_LIST.map((c) => ({ type_id: c.type_id, type_name: c.type_name })), list: [] };
   }
 }
 
 async function category(params, context) {
+  const page = Math.max(1, Number(params?.page || params?.pg || 1) || 1);
+  const typeId = String(params?.type_id || params?.tid || params?.categoryId || "Movie");
   try {
-    const typeId = String(params.type_id || params.tid || "Movie");
-    const page = Number(params.page || 1);
-    const extend = params.extend || {};
-    const url = buildCategoryUrl(typeId, page, extend);
-    const html = await requestHtml(url);
-    const list = parseListItems(html, typeId);
-    const pagecount = extractPageCount(html, typeId, String(extend?.cate || ""));
-    logInfo("分类解析完成", { typeId, page, listCount: list.length, pagecount, extend });
-    return {
-      page,
-      pagecount: Math.max(pagecount, page),
-      total: Math.max(list.length, 1) * Math.max(pagecount, page),
-      list,
-    };
+    const url = buildCategoryUrl(typeId, page);
+    const html = await requestHtml(url, absUrl(buildCategoryUrl(typeId, 1)));
+    const list = parseCards(html);
+    const pagecount = parsePageCount(html);
+    await logInfo(`category ${typeId} page=${page}/${pagecount} list=${list.length}`);
+    return { page, pagecount, total: pagecount * PAGE_SIZE_HINT, list };
   } catch (error) {
-    logError("category 失败", error);
-    return {
-      page: Number(params.page || 1),
-      pagecount: Number(params.page || 1),
-      total: 0,
-      list: [],
-    };
+    await logInfo(`category ${typeId} page=${page} 失败: ${error.message}`);
+    return { page, pagecount: page, total: 0, list: [] };
   }
 }
 
+// 详情页：每个 play-card 卡片是一条线路，episode-list 里是分集
+function parseDetail(html, pageUrl) {
+  const $ = cheerio.load(html || "", { decodeEntities: false });
+  const vodName = decodeHtml($("h1").first().text() || $("title").first().text().split("-")[0]).replace(/^《|》$/g, "");
+  const vodPic = absUrl($('meta[property="og:image"]').attr("content") || $(".poster img").first().attr("src") || "");
+  const vodContent = decodeHtml($('meta[property="og:description"]').attr("content") || "");
+  const text = String(html || "");
+  const year = (text.match(/((?:19|20)\d{2})-\d{2}-\d{2}/) || [])[1] || "";
+  const pickInfo = (keyword) => {
+    const m = text.match(new RegExp(`${keyword}[:：]?\\s*<\\/[^>]+>\\s*(?:<[^>]+>\\s*)*([^<]{1,80})`));
+    return decodeHtml(m ? m[1] : "");
+  };
+  const director = pickInfo("导演");
+  const actor = pickInfo("主演");
+
+  const sources = [];
+  const chunks = text.split('class="card mb-3 play-card"');
+  for (let i = 1; i < chunks.length; i += 1) {
+    const chunk = chunks[i];
+    const nameMatch = chunk.match(/<b>『[^』]*』([^<]+)<\/b>/);
+    const lineName = decodeHtml(nameMatch ? nameMatch[1] : `线路${i}`) || `线路${i}`;
+    const episodes = [];
+    const seen = new Set();
+    const re = /href="([^"]*\/play-(\d+)-(\d+)\.html)"[^>]*>([^<]*)</g;
+    let m;
+    while ((m = re.exec(chunk))) {
+      const path = m[1];
+      if (seen.has(path)) continue;
+      seen.add(path);
+      const label = decodeHtml(m[4]) || `第${Number(m[3]) + 1}集`;
+      episodes.push({ name: label, playId: absUrl(path) });
+    }
+    if (episodes.length) sources.push({ name: lineName, episodes });
+  }
+
+  const typeId = getTypeId(pageUrl);
+  return {
+    vod_id: pageUrl,
+    vod_name: vodName,
+    vod_pic: vodPic,
+    vod_content: vodContent,
+    vod_year: year,
+    vod_actor: actor,
+    vod_director: director,
+    vod_remarks: "",
+    type_id: typeId,
+    type_name: getTypeName(typeId),
+    vod_play_sources: sources,
+  };
+}
+
 async function detail(params, context) {
+  const vodId = String(params?.vod_id || params?.videoId || params?.id || "").trim();
+  if (!vodId) return { list: [] };
+  const pageUrl = absUrl(vodId);
   try {
-    const vodId = String(params.vod_id || params.videoId || params.id || "");
-    if (!vodId) {
-      throw new Error("缺少 vodId/videoId");
+    const html = await requestHtml(pageUrl);
+    const vod = parseDetail(html, pageUrl);
+    if (!vod.vod_name) {
+      await logInfo(`detail ${vodId} 解析为空`);
+      return { list: [] };
     }
-    const html = await requestHtml(vodId);
-
-    const titleMatch = html.match(/<h1 class="title break-all">([\s\S]*?)<\/h1>/i);
-    const titleRaw = cleanText(titleMatch?.[1] || "");
-    const coverMatch = html.match(/<div class="cover">[\s\S]*?<img\s+src="([^"]+)"/i);
-    const vodPic = normalizePic(coverMatch?.[1] || "");
-    const scoreMatch = html.match(/豆瓣评分:\s*<\/span><b>([^<]+)<\/b>/i);
-    const remarksMatch = html.match(/状态:\s*<\/span><b>([^<]+)<\/b>/i);
-    const summaryMatch = html.match(/◎影片简介:\s*<\/p>([\s\S]*?)(?:<div id="player_list"|<p class="border-top pt-2 mt-2">|<\/div><div class="card card-thread">)/i);
-
-    const infoMap = {};
-    const infoRegex = /◎影片([^:：<]+)[:：]\s*([\s\S]*?)<\/p>/gi;
-    let infoMatch;
-    while ((infoMatch = infoRegex.exec(html))) {
-      infoMap[cleanText(infoMatch[1])] = cleanText(infoMatch[2]);
-    }
-
-    const sourceRegex = /<div id="player_list" class="clearfix mt-3">[\s\S]*?<h2 class="title[\s\S]*?』([^：]+)：[\s\S]*?<ul>([\s\S]*?)<\/ul>/gi;
-    const vodPlaySources = [];
-    let sourceMatch;
-    while ((sourceMatch = sourceRegex.exec(html))) {
-      const sourceName = cleanText(sourceMatch[1]);
-      const ulHtml = sourceMatch[2] || "";
-      const episodes = [];
-      const episodeRegex = /<a[^>]+title="([^"]*)"[^>]+href="([^"]+play-\d+-\d+\.html)"[^>]*>([\s\S]*?)<\/a>/gi;
-      let episodeMatch;
-      while ((episodeMatch = episodeRegex.exec(ulHtml))) {
-        const episodeTitle = cleanText(episodeMatch[1] || episodeMatch[3] || "播放");
-        const playPath = episodeMatch[2];
-        episodes.push({
-          name: episodeTitle,
-          playId: encodePlayMeta({
-            playPath,
-            source: sourceName,
-            episodeName: episodeTitle,
-            referer: buildUrl(vodId),
-            vodName: infoMap["片名"] || titleRaw,
-          }),
-        });
-      }
-      if (episodes.length) {
-        vodPlaySources.push({
-          name: sourceName,
-          episodes,
-        });
-      }
-    }
-
-    const vodName = infoMap["片名"] || titleRaw || cleanText(html.match(/<meta property="og:title" content="([^"]+)"/i)?.[1] || "");
-    const vodYear = (infoMap["上映年份"] || "").match(/\d{4}/)?.[0] || "";
-    const vodArea = infoMap["地区"] || "";
-    const vodDirector = infoMap["导演"] || "";
-    const vodActor = infoMap["主演"] || "";
-    const vodContent = cleanText(summaryMatch?.[1] || "");
-    const typeId = getTypeIdFromPath(vodId);
-    const vodDetail = {
-      vod_id: vodId,
-      vod_name: vodName,
-      vod_pic: vodPic,
-      type_id: typeId,
-      type_name: getClassName(typeId),
-      vod_year: vodYear,
-      vod_area: vodArea,
-      vod_director: vodDirector,
-      vod_actor: vodActor,
-      vod_remarks: remarksMatch ? cleanText(remarksMatch[1]) : (infoMap["备注"] || ""),
-      vod_douban_score: scoreMatch ? cleanText(scoreMatch[1]) : "",
-      vod_content: vodContent,
-      vod_play_sources: vodPlaySources,
-    };
-
-    logInfo("详情解析完成", { vodId, sourceCount: vodPlaySources.length });
-    return { list: [vodDetail] };
+    await logInfo(
+      `detail ${vod.vod_name} 线路=${vod.vod_play_sources.length} 集数=${vod.vod_play_sources.map((s) => s.episodes.length).join("/")}`
+    );
+    return { list: [vod] };
   } catch (error) {
-    logError("detail 失败", error);
+    await logInfo(`detail ${vodId} 失败: ${error.message}`);
     return { list: [] };
   }
 }
 
-async function search(params, context) {
-  try {
-    const wd = String(params.wd || params.keyword || params.key || "").trim();
-    if (!wd) {
-      return { page: 1, pagecount: 1, total: 0, list: [] };
-    }
-    const searchUrl = `/mipso.php?searchword=${encodeURIComponent(wd)}`;
-    const html = await requestHtml(searchUrl, { Referer: `${HOST}/mipso.php` });
-    const list = dedupeByVodId(parseSearchItems(html));
-    logInfo("搜索解析完成", { wd, listCount: list.length });
-    return {
-      page: 1,
-      pagecount: 1,
-      total: list.length,
-      list,
-    };
-  } catch (error) {
-    logError("search 失败", error);
-    return { page: 1, pagecount: 1, total: 0, list: [] };
+// 播放页里：var now=base64decode("aHR0cHM6Ly8uLi4vaW5kZXgubTN1OA==")
+// 注意别取 next —— 那是"下一集"的地址，老版本就踩过这个坑
+function extractPlayUrl(html) {
+  const text = String(html || "");
+  const m = text.match(/var\s+now\s*=\s*base64decode\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)/);
+  if (m) {
+    const decoded = Buffer.from(m[1], "base64").toString("utf8").trim();
+    if (/^https?:\/\//i.test(decoded)) return decoded;
   }
-}
-
-function parseSearchItems(html) {
-  const list = [];
-  const anchorRegex = /<a\s+href="((?:\/(?:Movie|Tv|Zy|Dm|qita)\/[^"]+\/))"[^>]*>([\s\S]*?)<\/a>/gi;
-  let match;
-  while ((match = anchorRegex.exec(html))) {
-    const detailPath = match[1];
-    const inner = match[2] || "";
-    const titleAttr = inner.match(/title="([^"]+)"/i)?.[1] || "";
-    const title = cleanText(titleAttr || inner);
-    if (!detailPath || !title || /首页|电影|电视剧|综艺|动漫|其他|搜索|留言/.test(title)) continue;
-    const windowStart = Math.max(0, match.index - 800);
-    const windowEnd = Math.min(html.length, match.index + 1600);
-    const snippet = html.slice(windowStart, windowEnd);
-    const pic = normalizePic(snippet.match(/<img\s+src="([^"]+)"/i)?.[1] || "");
-    const remarks = cleanText(snippet.match(/<button\s+class="hdtag">([\s\S]*?)<\/button>/i)?.[1] || "");
-    const score = cleanText(snippet.match(/<span\s+class="float-right">[\s\S]*?<\/i>\s*([\s\S]*?)<\/span>/i)?.[1] || "");
-    const typeId = getTypeIdFromPath(detailPath);
-    list.push({
-      vod_id: detailPath,
-      vod_name: title,
-      vod_pic: pic,
-      vod_remarks: remarks || score,
-      vod_douban_score: score,
-      type_id: typeId,
-      type_name: getClassName(typeId),
-    });
-  }
-  return list;
+  const plain = text.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i);
+  return plain ? plain[0] : "";
 }
 
 async function play(params, context) {
+  const raw = String(params?.play_id || params?.playId || params?.id || "").trim();
+  if (!raw) return { urls: [], parse: 1 };
+  const pageUrl = absUrl(raw);
   try {
-    const meta = decodePlayMeta(params.play_id || params.playId || params.id || "");
-    const playPath = meta.playPath || "";
-    if (!playPath) {
-      throw new Error("缺少 playPath");
+    const html = await requestHtml(pageUrl, `${HOST}/`);
+    const url = extractPlayUrl(html);
+    if (!url) {
+      await logInfo(`play 未找到 m3u8: ${raw}`);
+      return { urls: [{ name: "播放页", url: pageUrl }], parse: 1, header: PLAY_HEADERS };
     }
-    const html = await requestHtml(playPath, {
-      Referer: meta.referer || `${HOST}/`,
-    });
-    const pn = cleanText(html.match(/var\s+pn\s*=\s*"([^"]+)"/i)?.[1] || "");
-    const encodedUrl = cleanText(html.match(/var\s+next\s*=\s*base64decode\("([^"]+)"\)/i)?.[1] || "");
-    let directUrl = "";
-    if (encodedUrl) {
-      directUrl = Buffer.from(encodedUrl, "base64").toString("utf8");
-    }
-    if (!directUrl) {
-      throw new Error(`未找到直链，pn=${pn}`);
-    }
-
-    const response = {
-      parse: 0,
-      header: PLAY_HEADERS,
-      urls: [
-        {
-          name: meta.episodeName || "播放",
-          url: directUrl
-        },
-      ]};
-    logInfo("播放解析完成", { playPath, pn, hasDirectUrl: Boolean(directUrl) });
-    return response;
+    await logInfo(`play 直链 ${url.slice(0, 110)}`);
+    return { urls: [{ name: "云播", url }], parse: 0, header: { ...PLAY_HEADERS, Referer: pageUrl } };
   } catch (error) {
-    logError("play 失败", error);
-    return {
-      parse: 0,
-      urls: [],
-    };
+    await logInfo(`play 失败: ${error.message}`);
+    return { urls: [], parse: 1 };
   }
 }
+
+// 站内搜索被算术验证码挡住（56x20 图片，形如 5+6=?），没过验证就退化为扫列表页
+function normText(text = "") {
+  return String(text || "").toLowerCase().replace(/[\s\-_:：·,，.。'"!！?？()（）[\]/]/g, "");
+}
+
+async function scanSearch(keyword, context) {
+  const key = normText(keyword);
+  const cacheKey = `auete:scan:v1:${key}`;
+  try {
+    const cached = await OmniBox.getCache(cacheKey);
+    if (cached) return JSON.parse(cached);
+  } catch (_) {
+    /* 继续扫描 */
+  }
+  const out = [];
+  const seen = new Set();
+  for (const cat of CLASS_LIST) {
+    for (let page = 1; page <= SEARCH_SCAN_PAGES; page += 1) {
+      let html;
+      try {
+        html = await requestHtml(buildCategoryUrl(cat.type_id, page), absUrl(`${cat.path}index.html`));
+      } catch (_) {
+        break;
+      }
+      for (const item of parseCards(html)) {
+        if (seen.has(item.vod_id)) continue;
+        if (!normText(item.vod_name).includes(key)) continue;
+        seen.add(item.vod_id);
+        out.push(item);
+      }
+      if (out.length >= 30) break;
+      await sleep(200);
+    }
+    if (out.length >= 30) break;
+  }
+  try {
+    await OmniBox.setCache(cacheKey, JSON.stringify(out), SEARCH_CACHE_TTL);
+  } catch (_) {
+    /* 忽略 */
+  }
+  return out;
+}
+
+async function search(params, context) {
+  const page = Math.max(1, Number(params?.page || params?.pg || 1) || 1);
+  const keyword = String(params?.wd || params?.keyword || params?.key || "").trim();
+  if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
+
+  // 站内搜索基本每次都要算术验证码，没见过验证码就直接跳过它，省一次请求
+  let off = false;
+  try {
+    off = Boolean(await OmniBox.getCache("auete:scoff:v1"));
+  } catch (_) {
+    off = false;
+  }
+  if (off) {
+    await logInfo("search 站内搜索已知需要验证码，直接扫列表页");
+  }
+  try {
+    if (off) throw new Error("skip");
+    const html = await requestHtml(`/auete4so.php?searchword=${encodeURIComponent(keyword)}`, `${HOST}/`);
+    if (!/系统安全验证/.test(html)) {
+      const list = parseCards(html);
+      if (list.length) {
+        await logInfo(`search 站内 keyword=${keyword} list=${list.length}`);
+        return { page: 1, pagecount: 1, total: list.length, list };
+      }
+    } else {
+      await logInfo("search 站内需要算术验证码，改为扫列表页");
+      try {
+        await OmniBox.setCache("auete:scoff:v1", "1", 3600);
+      } catch (_) {
+        /* 忽略 */
+      }
+    }
+  } catch (error) {
+    if (error.message !== "skip") await logInfo(`search 站内失败: ${error.message}`);
+  }
+
+  const all = await scanSearch(keyword, context);
+  const pagecount = Math.max(1, Math.ceil(all.length / 30));
+  const list = page > pagecount ? [] : all.slice((page - 1) * 30, page * 30);
+  await logInfo(`search 本地扫描 keyword=${keyword} page=${page}/${pagecount} total=${all.length} list=${list.length}`);
+  return { page, pagecount, total: all.length, list };
+}
+
+module.exports = { home, category, detail, search, play };
+runner.run(module.exports);
