@@ -2,7 +2,7 @@
 // @author 梦
 // @description 站点 4k-av.com（4K 高清影视，画质优先、条目少而精）：支持首页、分类、搜索、详情与直链播放；站点有 Cloudflare 风控，请求节流 1.2s + 页面缓存；封面可用 KMP_IMG_PROXY=server/wsrv 加速
 // @dependencies cheerio
-// @version 1.0.9
+// @version 1.1.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4kav影院.js
 
 const OmniBox = require("omnibox_sdk");
@@ -583,15 +583,77 @@ function findInlineMedia(html) {
 }
 
 // 站内搜索 /s 被 Cloudflare 单独拦掉时的兜底：扫 /movie/、/tv/ 前几页做片名匹配。
-// fetchText 自带 1.2s 节流 + 页面缓存，第二次搜同一个词基本是命中缓存。
+// 注意：OmniBox 每次 execute 都是新进程，模块级 Map/变量不跨调用；
+// 冷却和扫描结果必须落到 OmniBox 缓存里，否则翻页会从头再扫一遍
+// （实测 page=1/2/3 各扫 6 页，每次 7 秒）。
 const SEARCH_SCAN_PAGES = Number(process.env.KMP_SEARCH_SCAN_PAGES || 3);
-const SEARCH_CACHE_TTL = 10 * 60 * 1000;
-const searchCache = new Map();
+const SEARCH_PAGE_SIZE = 30;
+const SCAN_CACHE_TTL = 900; // 秒
+const SCAN_CACHE_KEY = "kmp:scan:v1:";
+const SEARCH_OFF_KEY = "kmp:scoff:v1";
+
+function normText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[\s\-_:：·,，.。'"!！?？()（）[\]/]/g, "");
+}
+
+// 片名 / 副标题 / URL slug 三处一起匹配：不少老片条目名是英文，
+// 只有 slug（/tv/xxxxx-friends-ep01/）里带原名
+function matchItem(item, key) {
+  const name = normText(item?.vod_name);
+  const sub = normText(item?.vod_subtitle);
+  let slug = String(item?.vod_id || "").replace(/^https?:\/\/[^/]+/i, "");
+  try {
+    slug = decodeURIComponent(slug);
+  } catch (_) {
+    /* 保持原样 */
+  }
+  const slugText = normText(slug);
+  return Boolean(
+    (name && name.includes(key)) || (sub && sub.includes(key)) || (slugText && slugText.includes(key))
+  );
+}
+
+async function searchCooldownActive() {
+  if (Date.now() < searchBlockedUntil) return true;
+  try {
+    return Boolean(await OmniBox.getCache(SEARCH_OFF_KEY));
+  } catch (_) {
+    return false;
+  }
+}
+
+async function markSearchCooldown() {
+  searchBlockedUntil = Date.now() + BLOCK_COOLDOWN;
+  try {
+    await OmniBox.setCache(SEARCH_OFF_KEY, "1", Math.round(BLOCK_COOLDOWN / 1000));
+  } catch (_) {
+    /* 写缓存失败不影响返回 */
+  }
+}
+
+async function readScanCache(key) {
+  try {
+    const raw = await OmniBox.getCache(SCAN_CACHE_KEY + key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function writeScanCache(key, list) {
+  try {
+    await OmniBox.setCache(SCAN_CACHE_KEY + key, JSON.stringify(list), SCAN_CACHE_TTL);
+  } catch (_) {
+    /* 写缓存失败不影响返回 */
+  }
+}
 
 async function scanSearch(keyword, context) {
-  const key = keyword.toLowerCase();
-  const cached = searchCache.get(key);
-  if (cached && Date.now() - cached.at < SEARCH_CACHE_TTL) return cached.list;
+  const key = normText(keyword);
+  const cached = await readScanCache(key);
+  if (cached) return cached;
 
   const out = [];
   const seen = new Set();
@@ -604,18 +666,17 @@ async function scanSearch(keyword, context) {
         break;
       }
       for (const item of parseVodList(html, undefined, context)) {
-        const name = String(item?.vod_name || "");
-        if (!name || !name.toLowerCase().includes(key)) continue;
         const id = String(item?.vod_id || "");
         if (!id || seen.has(id)) continue;
+        if (!matchItem(item, key)) continue;
         seen.add(id);
         out.push(item);
       }
-      if (out.length >= 30) break;
+      if (out.length >= SEARCH_PAGE_SIZE) break;
     }
-    if (out.length >= 30) break;
+    if (out.length >= SEARCH_PAGE_SIZE) break;
   }
-  searchCache.set(key, { at: Date.now(), list: out });
+  await writeScanCache(key, out);
   return out;
 }
 
@@ -625,7 +686,9 @@ async function search(params, context) {
   if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
   try {
     // 1) 站内搜索：能通就用它（结果最准）
-    if (Date.now() >= searchBlockedUntil) {
+    if (await searchCooldownActive()) {
+      await OmniBox.log("info", "[4KMP][search] /s 冷却中，直接扫列表页");
+    } else {
       try {
         const url = `${BASE_URL}/s?y=${encodeURIComponent(keyword)}`;
         const html = await fetchText(url, { soft403: true });
@@ -635,15 +698,20 @@ async function search(params, context) {
           return { page, pagecount: 1, total: list.length, list };
         }
       } catch (error) {
+        if (/40[13]|429|503/.test(error.message)) await markSearchCooldown();
         await OmniBox.log("warn", `[4KMP][search] /s 不可用（${error.message}），改扫列表页`);
       }
-    } else {
-      await OmniBox.log("info", "[4KMP][search] /s 冷却中，直接扫列表页");
     }
-    // 2) 兜底：本地扫列表页匹配片名
-    const list = await scanSearch(keyword, context);
-    await OmniBox.log("info", `[4KMP][search] 本地扫描 keyword=${keyword} list=${list.length}`);
-    return { page, pagecount: 1, total: list.length, list };
+
+    // 2) 兜底：本地扫列表页匹配片名，结果落缓存并做分页
+    const all = await scanSearch(keyword, context);
+    const pagecount = Math.max(1, Math.ceil(all.length / SEARCH_PAGE_SIZE));
+    const list = page > pagecount ? [] : all.slice((page - 1) * SEARCH_PAGE_SIZE, page * SEARCH_PAGE_SIZE);
+    await OmniBox.log(
+      "info",
+      `[4KMP][search] 本地扫描 keyword=${keyword} page=${page}/${pagecount} total=${all.length} list=${list.length}`
+    );
+    return { page, pagecount, total: all.length, list };
   } catch (error) {
     await OmniBox.log("error", `[4KMP][search] ${error.message}`);
     return { page, pagecount: 0, total: 0, list: [] };
