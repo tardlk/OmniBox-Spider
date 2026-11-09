@@ -1,7 +1,7 @@
 // @name 枫叶4K影院
 // @description 枫叶4K影院 - https://www.zzztool.com/ 聚合鹅酷爱芒桃的4K影视站（MacCMS AJAX 列表 + player_aaaa 直链/解析）
 // @dependencies cheerio
-// @version 1.0.7
+// @version 1.0.8
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶4K影院.js
 
 const cheerio = require("cheerio");
@@ -495,6 +495,13 @@ async function getPlayerConfig() {
 // 否则返回空响应。注意解析页的 Referer 必须是 www.zzztool.com 的页面。
 async function resolveParseDirect(parseBase, target) {
   const started = Date.now();
+  const offKey = "zzz:pdirect:off:v1";
+  try {
+    // 解析站按 IP 限流，连着试只会越封越久：失败后静默一段时间，直接用嗅探兜底
+    if (await OmniBox.getCache(offKey)) return null;
+  } catch (_) {
+    /* 缓存不可用则继续尝试 */
+  }
   try {
     const origin = new URL(parseBase).origin;
     const pageUrl = `${origin}/player/?url=${encodeURIComponent(target)}`;
@@ -509,31 +516,64 @@ async function resolveParseDirect(parseBase, target) {
       await logInfo("解析接口 未取到 token");
       return null;
     }
-    const res = await OmniBox.request(`${origin}/player/mplayer.php`, {
-      method: "POST",
-      headers: {
-        "User-Agent": UA,
-        Referer: `${HOST}/`,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "X-Requested-With": "XMLHttpRequest",
+    // 注意：SDK 的 request() 只要带 body 就强制 Content-Type: application/json，
+    // 表单字符串会被当成 JSON 发出去，解析站直接回「请传递正确的json参数」。
+    // 所以这里先发 JSON 体；再退一步把参数放 query（空 body，避免被改成 JSON）。
+    const attempts = [
+      {
+        label: "json",
+        url: `${origin}/player/mplayer.php`,
+        headers: {
+          "User-Agent": UA,
+          Referer: `${HOST}/`,
+          "X-Requested-With": "XMLHttpRequest",
+        },
+        body: JSON.stringify({ url: u, token: te }),
       },
-      body: `url=${encodeURIComponent(u)}&token=${encodeURIComponent(te)}`,
-    });
-    let json = {};
-    const rawBody = unwrapBody(res.body);
-    try {
-      json = JSON.parse(rawBody || "{}");
-    } catch (_) {
-      json = {};
-    }
-    if (Number(json.code) !== 200 || !json.url) {
+      {
+        label: "query",
+        url: `${origin}/player/mplayer.php?url=${encodeURIComponent(u)}&token=${encodeURIComponent(te)}`,
+        headers: {
+          "User-Agent": UA,
+          Referer: `${HOST}/`,
+          "X-Requested-With": "XMLHttpRequest",
+        },
+        body: undefined,
+      },
+    ];
+    for (const attempt of attempts) {
+      let res;
+      try {
+        res = await OmniBox.request(attempt.url, {
+          method: "POST",
+          headers: attempt.headers,
+          body: attempt.body,
+        });
+      } catch (e) {
+        await logInfo(`解析接口(${attempt.label})异常: ${e.message}`);
+        continue;
+      }
+      const rawBody = unwrapBody(res.body);
+      let json = {};
+      try {
+        json = JSON.parse(rawBody || "{}");
+      } catch (_) {
+        json = {};
+      }
+      if (Number(json.code) === 200 && json.url) {
+        await logInfo(`解析接口成功(${attempt.label}) ${Date.now() - started}ms ${String(json.url).slice(0, 110)}`);
+        return { url: String(json.url), header: null };
+      }
       await logInfo(
-        `解析接口失败 code=${json.code || res.statusCode} msg=${json.msg || ""} 耗时=${Date.now() - started}ms body=${String(rawBody || "").slice(0, 120)}`
+        `解析接口(${attempt.label})失败 code=${json.code || res.statusCode} 耗时=${Date.now() - started}ms body=${String(rawBody || "").slice(0, 100)}`
       );
-      return null;
     }
-    await logInfo(`解析接口成功 ${Date.now() - started}ms ${String(json.url).slice(0, 110)}`);
-    return { url: String(json.url), header: null };
+    try {
+      await OmniBox.setCache(offKey, "1", 300);
+    } catch (_) {
+      /* 写缓存失败不影响返回 */
+    }
+    return null;
   } catch (e) {
     await logInfo(`解析接口异常: ${e.message}`);
     return null;
