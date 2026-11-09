@@ -1,8 +1,8 @@
 // @name Auete影视
 // @author 梦
-// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页
+// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页；豆瓣/百度图床封面自动走 wsrv 代理（AU_IMG_PROXY=auto|wsrv|site|off）
 // @dependencies cheerio
-// @version 2.1.0
+// @version 2.1.2
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/Auete影视.js
 
 const OmniBox = require("omnibox_sdk");
@@ -252,7 +252,7 @@ if __name__ == "__main__":
 const SESS_KEY = "auete:sess:v2";     // 已验证会话（PHPSESSID）
 const TS_KEY = "auete:srch:ts:v2";    // 上次成功搜索时间戳
 const RATE_GAP = 10500;               // 站点限制「10 秒一次」
-const SESS_TTL = 900;
+const SESS_TTL = 10800; // 3 小时；失效时命中验证页会自动重解
 
 async function cacheGet(key) {
   try {
@@ -323,8 +323,10 @@ async function waitRateGap() {
 }
 
 // 走站内搜索，拿不到就返回 null（由调用方回退本地扫描）
+const COOKIE_SESSION = String(process.env.AU_COOKIE || "").replace(/^\s*PHPSESSID=/i, "").trim();
+
 async function searchViaSite(keyword) {
-  const session = String((await cacheGet(SESS_KEY)) || "");
+  const session = COOKIE_SESSION || String((await cacheGet(SESS_KEY)) || "");
   if (session) {
     try {
       await waitRateGap();
@@ -374,6 +376,49 @@ function absUrl(path = "") {
   if (/^https?:\/\//i.test(value)) return value;
   if (value.startsWith("//")) return `https:${value}`;
   return `${HOST}${value.startsWith("/") ? "" : "/"}${value}`;
+}
+
+// ===== 封面 =====
+// 站点自身的封面来自多个第三方图床，其中：
+// - img3.doubanio.com 直连返回 418（防盗链），站点用 /img.php?url= 包一层，
+//   但这个代理很不稳（同样 URL 多次请求会返回 200 + 0 字节）
+// - pic.rmb.bdstatic.com 在部分网络下完全打不开（站点自己也会 fallback 到 loading.gif）
+// 所以默认把这类封面转给 wsrv.nl 图片代理（它去取原图再回传，绕开防盗链与线路问题）。
+// AU_IMG_PROXY=auto（默认）| wsrv | site | off
+const IMG_PROXY = String(process.env.AU_IMG_PROXY || "auto").trim().toLowerCase();
+const IMG_BAIDU = /(bdstatic\.com|(^|\.)baidu\.com)/i;
+
+function unwrapImgProxy(url = "") {
+  // 站点自带的 /img.php?url=<原图> 包装
+  const m = String(url).match(/\/img\.php\?url=(.+)$/i);
+  if (!m) return "";
+  let inner = m[1];
+  try {
+    inner = decodeURIComponent(inner);
+  } catch (_) {
+    /* 没编码就直接用 */
+  }
+  if (!/^https?:\/\//i.test(inner)) inner = `https://${inner}`;
+  return inner;
+}
+
+function toWsrv(url) {
+  return `https://wsrv.nl/?url=${encodeURIComponent(url)}`;
+}
+
+function finalizeImage(raw) {
+  const abs = absUrl(raw);
+  if (!abs) return "";
+  if (IMG_PROXY === "off") return abs;
+  const inner = unwrapImgProxy(abs);
+  const target = inner || abs;
+  if (IMG_PROXY === "site") return `${HOST}/img.php?url=${encodeURIComponent(target)}`;
+  if (IMG_PROXY === "wsrv") return toWsrv(target);
+  // auto：站点自己包过的（基本都是豆瓣图，直连 418、站点代理稳定）原样保留；
+  // 百度图床（pic.rmb.bdstatic.com 等）在部分网络打不开，转 wsrv 取图
+  if (inner) return abs;
+  if (IMG_BAIDU.test(target)) return toWsrv(target);
+  return target;
 }
 
 function cleanText(text = "") {
@@ -456,7 +501,7 @@ function parseCards(html) {
     );
     if (!name) return;
     seen.add(vodId);
-    const pic = absUrl($el.find("a.pic img, img").first().attr("src") || "");
+    const pic = finalizeImage($el.find("a.pic img, img").first().attr("src") || "");
     const remarks = decodeHtml($el.find(".hdtag").first().text());
     const score = cleanText($el.find(".rating").first().text()).replace(/分$/, "");
     const typeId = getTypeId(href);
@@ -515,7 +560,7 @@ async function category(params, context) {
 function parseDetail(html, pageUrl) {
   const $ = cheerio.load(html || "", { decodeEntities: false });
   const vodName = decodeHtml($("h1").first().text() || $("title").first().text().split("-")[0]).replace(/^《|》$/g, "");
-  const vodPic = absUrl($('meta[property="og:image"]').attr("content") || $(".poster img").first().attr("src") || "");
+  const vodPic = finalizeImage($('meta[property="og:image"]').attr("content") || $(".poster img").first().attr("src") || "");
   const vodContent = decodeHtml($('meta[property="og:description"]').attr("content") || "");
   const text = String(html || "");
   const year = (text.match(/((?:19|20)\d{2})-\d{2}-\d{2}/) || [])[1] || "";
