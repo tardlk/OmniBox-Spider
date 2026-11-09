@@ -1,7 +1,7 @@
 // @name 枫叶4K影院
 // @description 枫叶4K影院 - https://www.zzztool.com/ 聚合鹅酷爱芒桃的4K影视站（MacCMS AJAX 列表 + player_aaaa 直链/解析）
 // @dependencies cheerio
-// @version 1.0.3
+// @version 1.0.4
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶4K影院.js
 
 const cheerio = require("cheerio");
@@ -494,6 +494,75 @@ async function sniffDirect(targetUrl) {
   return null;
 }
 
+// 抽检 m3u8 首个分片是否真的存在：第三方解析线路（JD4K/co）偶尔会给到
+// CDN 上缺分片的残缺流（分片 404 NoSuchKey，m3u8 本身却是 200），
+// 客户端点进去只会黑屏，这里提前发现并换线。
+async function probeStream(m3u8Url) {
+  try {
+    const body = await httpGet(m3u8Url, HOST + "/");
+    let frag = String(body || "")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .find((s) => s && !s.startsWith("#"));
+    if (!frag) return true;
+    // master playlist 的子列表常是相对路径，必须拼成绝对地址才能探测
+    if (!/^https?:\/\//i.test(frag)) {
+      try {
+        frag = new URL(frag, m3u8Url).toString();
+      } catch (_) {
+        return true;
+      }
+    }
+    const res = await OmniBox.request(frag, {
+      method: "GET",
+      headers: { "User-Agent": UA, Range: "bytes=0-1023" },
+    });
+    const ok = (res.statusCode >= 200 && res.statusCode < 300) || res.statusCode === 206;
+    await logInfo(`分片抽检 ${res.statusCode} ${ok ? "可用" : "缺失"} ${frag.slice(0, 100)}`);
+    return ok;
+  } catch (e) {
+    await logInfo(`分片抽检失败（放行）: ${e.message}`);
+    return true;
+  }
+}
+
+// 当前集在别的线路里找一条直链：详情页拿到同 nid 的其它 sid，逐个取 player_aaaa
+async function findAltDirect(videoId, nid, excludeSid) {
+  try {
+    const detailUrl = `${HOST}/detail/${videoId}.html`;
+    const html = await httpGet(detailUrl);
+    const $ = cheerio.load(html);
+    const sids = [];
+    $("a.mx-anthology-link[href]").each((_, el) => {
+      const m = String($(el).attr("href") || "").match(/\/play\/(\d+)-(\d+)-(\d+)\.html/);
+      if (!m || m[3] !== nid || m[2] === excludeSid) return;
+      if (!sids.includes(m[2])) sids.push(m[2]);
+    });
+    for (const sid of sids.slice(0, 4)) {
+      try {
+        const page = await httpGet(`${HOST}/play/${videoId}-${sid}-${nid}.html`, detailUrl);
+        const pm = page.match(/var player_aaaa=(\{[\s\S]*?\})<\/script>/);
+        if (!pm) continue;
+        const data = JSON.parse(pm[1]);
+        const target = String(data.url || "");
+        if (/^https?:\/\/[^\s]+\.(m3u8|mp4|flv)(\?|$)/i.test(target)) {
+          if (!(await probeStream(target))) {
+            await logInfo(`备选 sid=${sid} 分片同样缺失，继续找下一条`);
+            continue;
+          }
+          await logInfo(`换线成功 sid=${sid} nid=${nid} ${target.slice(0, 100)}`);
+          return { sid, url: target, name: `备选线路 ${sid}` };
+        }
+      } catch (_) {
+        /* 单条线路失败继续下一条 */
+      }
+    }
+  } catch (e) {
+    await logInfo(`换线查找失败: ${e.message}`);
+  }
+  return null;
+}
+
 // 不要带站点 Referer：实测 svip.ryiplay18.com 带 Referer 会直接 SSL 断连（code=000），
 // 不带 Referer 反而 200；dytt-tvs / yzzy 两条线有没有 Referer 都正常。
 // 解析线路优先用嗅探器抓到的真实请求头。
@@ -547,11 +616,24 @@ async function play(params, context) {
       }
       const sniffed = await sniffDirect(parseUrl);
       if (sniffed) {
-        return {
-          urls: [{ name: entry.show || "解析", url: sniffed.url }],
-          parse: 0,
-          header: { ...PLAY_HEADER, ...(sniffed.header || {}) },
-        };
+        const lineName = entry.show || "解析";
+        const header = { ...PLAY_HEADER, ...(sniffed.header || {}) };
+        if (await probeStream(sniffed.url)) {
+          return { urls: [{ name: lineName, url: sniffed.url }], parse: 0, header };
+        }
+        // 这集的解析流是残缺的（分片 404），换同集直链线路，坏线路放后面备查
+        const alt = await findAltDirect(videoId, nid, sid);
+        if (alt) {
+          return {
+            urls: [
+              { name: alt.name, url: alt.url },
+              { name: `${lineName}（源缺失）`, url: sniffed.url },
+            ],
+            parse: 0,
+            header: PLAY_HEADER,
+          };
+        }
+        return { urls: [{ name: `${lineName}（源缺失）`, url: sniffed.url }], parse: 0, header };
       }
       await logInfo(`play 解析回退 sid=${sid} 耗时=${Date.now() - started}ms`);
       return { urls: [{ name: entry.show || "解析", url: parseUrl }], parse: 1, header: PLAY_HEADER };
