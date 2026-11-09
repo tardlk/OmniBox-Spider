@@ -2,7 +2,7 @@
 // @author 梦
 // @description 站点 4k-av.com（4K 高清影视，画质优先、条目少而精）：支持首页、分类、搜索、详情与直链播放；站点有 Cloudflare 风控，请求节流 1.2s + 页面缓存；封面可用 KMP_IMG_PROXY=server/wsrv 加速
 // @dependencies cheerio
-// @version 1.0.8
+// @version 1.0.9
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4kav影院.js
 
 const OmniBox = require("omnibox_sdk");
@@ -22,6 +22,9 @@ const MAX_CACHE_ENTRIES = 40;
 
 let lastRequestAt = 0;
 let blockedUntil = 0;
+// /s 搜索接口在 Cloudflare 上是单独加严的（首页/详情 200，/s 直接 403），
+// 不能让它把整个源一起冻住，所以搜索单独记冷却。
+let searchBlockedUntil = 0;
 const pageCache = new Map();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -193,7 +196,7 @@ async function fetchText(url, options = {}) {
     return cached;
   }
 
-  if (blockedUntil > Date.now()) {
+  if (!options.soft403 && blockedUntil > Date.now()) {
     const left = Math.ceil((blockedUntil - Date.now()) / 1000);
     throw new Error(`站点风控冷却中，约 ${left} 秒后自动恢复（别连续点）`);
   }
@@ -222,6 +225,10 @@ async function fetchText(url, options = {}) {
     // 403 / 429 / 503 是 Cloudflare 风控，继续重试等于反复敲同一扇门，
     // 只会把封禁时间拉长；这里直接放弃并进入冷静期。
     if (statusCode === 403 || statusCode === 429 || statusCode === 503) {
+      if (options.soft403) {
+        searchBlockedUntil = Date.now() + BLOCK_COOLDOWN;
+        throw new Error(`搜索接口返回 ${statusCode}（站点对 /s 单独拦了）`);
+      }
       blockedUntil = Date.now() + BLOCK_COOLDOWN;
       throw new Error(
         `站点返回 ${statusCode}（Cloudflare 风控）。已暂停 ${Math.round(BLOCK_COOLDOWN / 1000)} 秒，` +
@@ -568,21 +575,75 @@ async function detail(params, context) {
   }
 }
 
+// 页面里直接写着的 m3u8/mp4（含内联脚本里 \/ 转义的形式）
+function findInlineMedia(html) {
+  const text = String(html || "").replace(/\\\//g, "/");
+  const found = text.match(/https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mp4|m4v|flv)(?:\?[^\s"'<>\\]*)?/gi) || [];
+  return found.find((u) => !/trailer|preview|sample|poster|\.jpg|\.png/i.test(u)) || "";
+}
+
+// 站内搜索 /s 被 Cloudflare 单独拦掉时的兜底：扫 /movie/、/tv/ 前几页做片名匹配。
+// fetchText 自带 1.2s 节流 + 页面缓存，第二次搜同一个词基本是命中缓存。
+const SEARCH_SCAN_PAGES = Number(process.env.KMP_SEARCH_SCAN_PAGES || 3);
+const SEARCH_CACHE_TTL = 10 * 60 * 1000;
+const searchCache = new Map();
+
+async function scanSearch(keyword, context) {
+  const key = keyword.toLowerCase();
+  const cached = searchCache.get(key);
+  if (cached && Date.now() - cached.at < SEARCH_CACHE_TTL) return cached.list;
+
+  const out = [];
+  const seen = new Set();
+  for (const base of ["/movie/", "/tv/"]) {
+    for (let p = 1; p <= SEARCH_SCAN_PAGES; p += 1) {
+      let html;
+      try {
+        html = await fetchText(buildPagedPath(base, p, 99), { referer: `${BASE_URL}/` });
+      } catch (_) {
+        break;
+      }
+      for (const item of parseVodList(html, undefined, context)) {
+        const name = String(item?.vod_name || "");
+        if (!name || !name.toLowerCase().includes(key)) continue;
+        const id = String(item?.vod_id || "");
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        out.push(item);
+      }
+      if (out.length >= 30) break;
+    }
+    if (out.length >= 30) break;
+  }
+  searchCache.set(key, { at: Date.now(), list: out });
+  return out;
+}
+
 async function search(params, context) {
   const page = Math.max(1, Number(params?.page || params?.pg || 1) || 1);
+  const keyword = String(params?.keyword || params?.key || params?.wd || "").trim();
+  if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
   try {
-    const keyword = String(params?.keyword || params?.key || params?.wd || "").trim();
-    if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
-    const url = `${BASE_URL}/s?y=${encodeURIComponent(keyword)}`;
-    const html = await fetchText(url);
-    const list = refineSearchResults(parseVodList(html, undefined, context), keyword);
-    await OmniBox.log("info", `[4KMP][search] keyword=${keyword} list=${list.length}`);
-    return {
-      page,
-      pagecount: 1,
-      total: list.length,
-      list,
-    };
+    // 1) 站内搜索：能通就用它（结果最准）
+    if (Date.now() >= searchBlockedUntil) {
+      try {
+        const url = `${BASE_URL}/s?y=${encodeURIComponent(keyword)}`;
+        const html = await fetchText(url, { soft403: true });
+        const list = refineSearchResults(parseVodList(html, undefined, context), keyword);
+        if (list.length) {
+          await OmniBox.log("info", `[4KMP][search] /s keyword=${keyword} list=${list.length}`);
+          return { page, pagecount: 1, total: list.length, list };
+        }
+      } catch (error) {
+        await OmniBox.log("warn", `[4KMP][search] /s 不可用（${error.message}），改扫列表页`);
+      }
+    } else {
+      await OmniBox.log("info", "[4KMP][search] /s 冷却中，直接扫列表页");
+    }
+    // 2) 兜底：本地扫列表页匹配片名
+    const list = await scanSearch(keyword, context);
+    await OmniBox.log("info", `[4KMP][search] 本地扫描 keyword=${keyword} list=${list.length}`);
+    return { page, pagecount: 1, total: list.length, list };
   } catch (error) {
     await OmniBox.log("error", `[4KMP][search] ${error.message}`);
     return { page, pagecount: 0, total: 0, list: [] };
@@ -624,6 +685,33 @@ async function play(params, context) {
         urls: mediaSources.map((item) => ({ name: item.name, url: item.url })),
         header: playHeaders,
         headers: playHeaders};
+    }
+
+    // 页面里直接写着 m3u8/mp4（含内联脚本里 \/ 转义）时，不用再等 8~15 秒嗅探
+    const inline = findInlineMedia(html);
+    if (inline) {
+      const playHeaders = buildPlayHeaders(pageUrl);
+      await OmniBox.log("info", `[4KMP][play] 页面内联直链 ${inline.slice(0, 120)}`);
+      return {
+        parse: 0,
+        jx: 0,
+        url: inline,
+        urls: [{ name: meta.title || "直链", url: inline }],
+        header: playHeaders,
+        headers: playHeaders};
+    }
+
+    // 只有磁力/ed2k/网盘的下载页没有在线流，嗅探注定白等 15 秒
+    const hasIframe = $("iframe[src]").length > 0;
+    if (!hasIframe && /magnet:\?|ed2k:\/\/|pan\.(?:baidu|quark)\.|115\.com/i.test(html)) {
+      await OmniBox.log("warn", "[4KMP][play] 该页只有下载链接（磁力/网盘），没有在线流");
+      return {
+        parse: 1,
+        jx: 1,
+        url: pageUrl,
+        urls: [{ name: `${meta.title || "播放页"}（仅下载，无在线流）`, url: pageUrl }],
+        header: headers,
+        headers};
     }
 
     if (typeof OmniBox.sniffVideo === "function") {
