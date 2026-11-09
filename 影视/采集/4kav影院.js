@@ -2,7 +2,7 @@
 // @author 梦
 // @description 站点 4k-av.com（4K 高清影视，画质优先、条目少而精）：支持首页、分类、搜索、详情与直链播放；站点有 Cloudflare 风控，请求节流 1.2s + 页面缓存；封面可用 KMP_IMG_PROXY=server/wsrv 加速
 // @dependencies cheerio
-// @version 1.1.0
+// @version 1.1.1
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4kav影院.js
 
 const OmniBox = require("omnibox_sdk");
@@ -10,7 +10,13 @@ const runner = require("spider_runner");
 const cheerio = require("cheerio");
 
 const BASE_URL = "https://4k-av.com";
-const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15";
+// 参考 GitHub 上能跑通的 4K-AV TVBox 爬虫（default7869/jaychouqq 的 4K影视_2.py）：
+// 它用的是 macOS 上的 Chrome 134 + sec-ch-ua 系列头，而不是 Safari。
+// Cloudflare 会看 UA 与 sec-ch-ua 是否自洽，Safari UA 配不上这些头反而更容易被判 bot。
+const UA = process.env.KMP_UA || "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+// 可选：浏览器里过掉 CF 挑战后复制整串 Cookie（关键是 cf_clearance），
+// /s 搜索对无 cookie 的请求基本必 403。
+const COOKIE = String(process.env.KMP_COOKIE || "").trim();
 const REQUEST_TIMEOUT = Number(process.env.KMP_TIMEOUT || 20000);
 // 站点在 Cloudflare 后面，短时间内多次请求会直接 403（风控）。
 // 连续点击详情页 3~4 次就可能触发，触发后整个域名在一段时间内全返 403。
@@ -164,27 +170,34 @@ function buildHeaders(referer = `${BASE_URL}/`, extra = {}) {
   // 补上真实 Safari 会带的 Sec-Fetch-* / Upgrade-Insecure-Requests，
   // 能明显降低被风控的概率（拿不到 cf_clearance cookie，只能靠这些特征）。
   const sameSite = ref.startsWith(BASE_URL);
-  return {
+  const headers = {
     "User-Agent": UA,
-    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control": "max-age=0",
     "Upgrade-Insecure-Requests": "1",
+    "Sec-CH-UA": '"Not/A)Brand";v="8", "Chromium";v="134", "Google Chrome";v="134"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"macOS"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": sameSite ? "same-origin" : "none",
     Referer: ref,
     ...extra,
   };
+  if (COOKIE) headers.Cookie = COOKIE;
+  return headers;
 }
 
 function buildPlayHeaders(referer = `${BASE_URL}/`) {
-  return {
+  const headers = {
     "User-Agent": UA,
     Referer: referer || `${BASE_URL}/`,
     Origin: BASE_URL,
   };
+  if (COOKIE) headers.Cookie = COOKIE;
+  return headers;
 }
 
 async function fetchText(url, options = {}) {
@@ -689,17 +702,20 @@ async function search(params, context) {
     if (await searchCooldownActive()) {
       await OmniBox.log("info", "[4KMP][search] /s 冷却中，直接扫列表页");
     } else {
-      try {
-        const url = `${BASE_URL}/s?y=${encodeURIComponent(keyword)}`;
-        const html = await fetchText(url, { soft403: true });
-        const list = refineSearchResults(parseVodList(html, undefined, context), keyword);
-        if (list.length) {
-          await OmniBox.log("info", `[4KMP][search] /s keyword=${keyword} list=${list.length}`);
-          return { page, pagecount: 1, total: list.length, list };
+      // 站点搜索有两个参数：GitHub 上能跑的 TVBox 爬虫用的是 /s?k=，旧版脚本用的是 /s?y=。
+      // 两个都试，能出一个结果就够；都 403 就进冷却并改扫列表页。
+      for (const param of ["k", "y"]) {
+        try {
+          const url = `${BASE_URL}/s?${param}=${encodeURIComponent(keyword)}`;
+          const html = await fetchText(url, { soft403: true });
+          const list = refineSearchResults(parseVodList(html, undefined, context), keyword);
+          await OmniBox.log("info", `[4KMP][search] /s?${param}= keyword=${keyword} list=${list.length}`);
+          if (list.length) return { page, pagecount: 1, total: list.length, list };
+        } catch (error) {
+          if (/40[13]|429|503/.test(error.message)) await markSearchCooldown();
+          await OmniBox.log("warn", `[4KMP][search] /s?${param}= 不可用（${error.message}）`);
+          break; // 403 说明整条 /s 都被拦，换参数没用
         }
-      } catch (error) {
-        if (/40[13]|429|503/.test(error.message)) await markSearchCooldown();
-        await OmniBox.log("warn", `[4KMP][search] /s 不可用（${error.message}），改扫列表页`);
       }
     }
 
@@ -744,6 +760,9 @@ async function play(params, context) {
     const $ = cheerio.load(html || "", { decodeEntities: false });
     const mediaSources = parseMediaSources($, pageUrl);
     const firstUrl = mediaSources[0]?.url || "";
+    if (!firstUrl && $("#MainContent_videowindow source").length) {
+      await OmniBox.log("warn", "[4KMP][play] 找到 #MainContent_videowindow source 但没取到 src");
+    }
     if (firstUrl) {
       const playHeaders = buildPlayHeaders(pageUrl);
       return {
