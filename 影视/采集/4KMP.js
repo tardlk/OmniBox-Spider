@@ -1,8 +1,8 @@
-// @name 4KMP
+// @name 4k-av影院
 // @author 梦
-// @description 4k-av.com：支持首页、分类、搜索、详情与直链播放，站点请求使用苹果 Safari UA；带请求节流(1.2s)与页面缓存以避免 Cloudflare 风控；封面可用 KMP_IMG_PROXY=server/wsrv 加速
+// @description 站点 4k-av.com（4K 高清影视，画质优先、条目少而精）：支持首页、分类、搜索、详情与直链播放；站点有 Cloudflare 风控，请求节流 1.2s + 页面缓存；封面可用 KMP_IMG_PROXY=server/wsrv 加速
 // @dependencies cheerio
-// @version 1.0.6
+// @version 1.0.7
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/4KMP.js
 
 const OmniBox = require("omnibox_sdk");
