@@ -1,7 +1,7 @@
 // @name 枫叶4K影院
 // @description 枫叶4K影院 - https://www.zzztool.com/ 聚合鹅酷爱芒桃的4K影视站（MacCMS AJAX 列表 + player_aaaa 直链/解析）
 // @dependencies cheerio
-// @version 1.0.8
+// @version 1.0.9
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶4K影院.js
 
 const cheerio = require("cheerio");
@@ -818,19 +818,8 @@ async function play(params, context) {
         const header = { ...PLAY_HEADER, ...(sniffed.header || {}) };
         const probe = await probeStream(sniffed.url);
         if (probe.ok) {
-          // 4K 原片单片 8MB 左右（≈13Mbps），带宽一般的端会卡：
-          // 这类线路额外附上同集的 1080p 直链，客户端里可直接换线。
-          if (probe.segBytes >= 2.5 * 1024 * 1024) {
-            const alts = await findAltDirects(videoId, nid, sid, 2);
-            if (alts.length) {
-              await logInfo(`play ${lineName} 单片≈${(probe.segBytes / 1048576).toFixed(1)}MB，附 ${alts.length} 条 1080p 备选`);
-              return {
-                urls: [{ name: lineName, url: sniffed.url }, ...alts.map((a) => ({ name: `${a.name}（1080p）`, url: a.url }))],
-                parse: 0,
-                header,
-              };
-            }
-          }
+          // 4K 线路码率高（单片 8MB≈13Mbps），但不再在 play 里顺带探 1080p 备选：
+          // 那要多花 2~3 秒，而详情页本来就列着自营t/y/r，卡了直接换线路即可。
           return { urls: [{ name: lineName, url: sniffed.url }], parse: 0, header };
         }
         // 这集的解析流是残缺/占位的（分片 404、302 到失效页、演示 gif），
