@@ -1,8 +1,8 @@
 // @name Auete影视
 // @author 梦
-// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页；百度图床封面自动转 wsrv 代理（AU_IMG_PROXY=auto|wsrv|site|off）
+// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页；百度图床封面走 OmniBox 服务端图片代理（AU_IMG_PROXY=auto|server|wsrv|site|off）
 // @dependencies cheerio
-// @version 2.1.3
+// @version 2.2.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/Auete影视.js
 
 const OmniBox = require("omnibox_sdk");
@@ -387,6 +387,13 @@ function absUrl(path = "") {
 // AU_IMG_PROXY=auto（默认）| wsrv | site | off
 const IMG_PROXY = String(process.env.AU_IMG_PROXY || "auto").trim().toLowerCase();
 const IMG_BAIDU = /(bdstatic\.com|(^|\.)baidu\.com)/i;
+// OmniBox 自带服务端图片代理：由 NAS 拉图再回给客户端，客户端网络再差也能显示
+let IMG_BASE = "";
+
+function setImgBase(context) {
+  const base = String((context && context.baseURL) || "").replace(/\/+$/, "");
+  if (base) IMG_BASE = base;
+}
 
 function unwrapImgProxy(url = "") {
   // 站点自带的 /img.php?url=<原图> 包装
@@ -406,6 +413,12 @@ function toWsrv(url) {
   return `https://wsrv.nl/?url=${encodeURIComponent(url)}`;
 }
 
+// 服务端代理：/api/proxy/image?url=<原图>，由 OmniBox 自己把图拉回来
+function serverProxy(url) {
+  if (!IMG_BASE) return "";
+  return `${IMG_BASE}/api/proxy/image?url=${encodeURIComponent(url)}`;
+}
+
 function finalizeImage(raw) {
   const abs = absUrl(raw);
   if (!abs) return "";
@@ -414,10 +427,11 @@ function finalizeImage(raw) {
   const target = inner || abs;
   if (IMG_PROXY === "site") return `${HOST}/img.php?url=${encodeURIComponent(target)}`;
   if (IMG_PROXY === "wsrv") return toWsrv(target);
-  // auto：站点自己包过的（基本都是豆瓣图，直连 418、站点代理稳定）原样保留；
-  // 百度图床（pic.rmb.bdstatic.com 等）在部分网络打不开，转 wsrv 取图
+  if (IMG_PROXY === "server") return serverProxy(target) || toWsrv(target);
+  // auto：站点自己包过的（基本都是豆瓣图，直连 418、站点 img.php 稳定）原样保留；
+  // 百度图床（pic.rmb.bdstatic.com 等）客户端常打不开，交给服务端代理拉图
   if (inner) return abs;
-  if (IMG_BAIDU.test(target)) return toWsrv(target);
+  if (IMG_BAIDU.test(target)) return serverProxy(target) || toWsrv(target);
   return target;
 }
 
@@ -529,6 +543,7 @@ function buildCategoryUrl(typeId, page) {
 }
 
 async function home(params, context) {
+  setImgBase(context);
   try {
     const html = await requestHtml("/index.html");
     const list = parseCards(html).slice(0, 40);
@@ -541,6 +556,7 @@ async function home(params, context) {
 }
 
 async function category(params, context) {
+  setImgBase(context);
   const page = Math.max(1, Number(params?.page || params?.pg || 1) || 1);
   const typeId = String(params?.type_id || params?.tid || params?.categoryId || "Movie");
   try {
@@ -608,6 +624,7 @@ function parseDetail(html, pageUrl) {
 }
 
 async function detail(params, context) {
+  setImgBase(context);
   const vodId = String(params?.vod_id || params?.videoId || params?.id || "").trim();
   if (!vodId) return { list: [] };
   const pageUrl = absUrl(vodId);
@@ -704,6 +721,7 @@ async function scanSearch(keyword, context) {
 }
 
 async function search(params, context) {
+  setImgBase(context);
   const page = Math.max(1, Number(params?.page || params?.pg || 1) || 1);
   const keyword = String(params?.wd || params?.keyword || params?.key || "").trim();
   if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
