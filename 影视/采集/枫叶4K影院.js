@@ -1,7 +1,7 @@
 // @name 枫叶4K影院
 // @description 枫叶4K影院 - https://www.zzztool.com/ 聚合鹅酷爱芒桃的4K影视站（MacCMS AJAX 列表 + player_aaaa 直链/解析）
 // @dependencies cheerio
-// @version 1.0.5
+// @version 1.0.6
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶4K影院.js
 
 const cheerio = require("cheerio");
@@ -503,73 +503,154 @@ async function sniffDirect(targetUrl) {
   return null;
 }
 
-// 抽检 m3u8 首个分片是否真的存在：第三方解析线路（JD4K/co）偶尔会给到
-// CDN 上缺分片的残缺流（分片 404 NoSuchKey，m3u8 本身却是 200），
-// 客户端点进去只会黑屏，这里提前发现并换线。
-async function probeStream(m3u8Url) {
+// 站点解析出来的“流”不一定真能播：实测两种假货
+//   1) sid=9 蓝光2k：解析出 https://yun.jiexicn.top/api/vod/demo/playlist.m3u8，
+//      m3u8 与分片都是 200，但分片是一张 1px gif（演示占位流）
+//   2) sid=8 蓝光2k：解析出 cibn 的 m3u8，带 auth_key 已失效，302 到失效页
+// 只判「状态码 200」会把它们当成功，客户端点进去照样黑屏。
+const PLACEHOLDER_HINTS = ["/api/vod/demo/", "image.baidu.com", "console.lookbook.top", "picsum.photos"];
+
+function absUrl(u, base) {
   try {
-    const body = await httpGet(m3u8Url, HOST + "/");
-    let frag = String(body || "")
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .find((s) => s && !s.startsWith("#"));
-    if (!frag) return true;
-    // master playlist 的子列表常是相对路径，必须拼成绝对地址才能探测
-    if (!/^https?:\/\//i.test(frag)) {
-      try {
-        frag = new URL(frag, m3u8Url).toString();
-      } catch (_) {
-        return true;
-      }
-    }
-    const res = await OmniBox.request(frag, {
-      method: "GET",
-      headers: { "User-Agent": UA, Range: "bytes=0-1023" },
-    });
-    const ok = (res.statusCode >= 200 && res.statusCode < 300) || res.statusCode === 206;
-    await logInfo(`分片抽检 ${res.statusCode} ${ok ? "可用" : "缺失"} ${frag.slice(0, 100)}`);
-    return ok;
-  } catch (e) {
-    await logInfo(`分片抽检失败（放行）: ${e.message}`);
-    return true;
+    return new URL(u, base).toString();
+  } catch (_) {
+    return u;
   }
 }
 
-// 当前集在别的线路里找一条直链：详情页拿到同 nid 的其它 sid，逐个取 player_aaaa
-async function findAltDirect(videoId, nid, excludeSid) {
+async function fetchPlaylist(url) {
+  const res = await OmniBox.request(url, { method: "GET", headers: { "User-Agent": UA } });
+  if (res.statusCode < 200 || res.statusCode >= 300) throw new Error(`HTTP ${res.statusCode}`);
+  return unwrapBody(res.body);
+}
+
+// master playlist 只给一路 variant（index.m3u8 -> 3000k/hls/mixed.m3u8），
+// 必须跟到真正的分片列表，否则“首个非 # 行”其实还是个子 m3u8。
+async function resolveSegments(m3u8Url, depth = 0) {
+  const text = String(await fetchPlaylist(m3u8Url));
+  if (!/#EXTM3U/i.test(text)) throw new Error("不是 m3u8");
+  const lines = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const subs = lines.filter((l) => !l.startsWith("#"));
+  if (/#EXT-X-STREAM-INF/i.test(text) && depth < 2 && subs.length) {
+    return resolveSegments(absUrl(subs[0], m3u8Url), depth + 1);
+  }
+  return { text, segments: subs.map((s) => absUrl(s, m3u8Url)) };
+}
+
+// 返回 { ok, segBytes }：既判可播，也顺便量一下分片大小（4K 单片 8MB 左右，
+// 带宽不够的端会卡，用于决定要不要额外给几条 1080p 备选）
+async function probeStream(m3u8Url) {
+  try {
+    if (PLACEHOLDER_HINTS.some((h) => m3u8Url.includes(h))) {
+      await logInfo(`分片抽检 占位流 ${m3u8Url.slice(0, 100)}`);
+      return { ok: false, segBytes: 0 };
+    }
+    const { text, segments } = await resolveSegments(m3u8Url);
+    if (PLACEHOLDER_HINTS.some((h) => text.includes(h))) {
+      await logInfo("分片抽检 播放列表是演示占位内容");
+      return { ok: false, segBytes: 0 };
+    }
+    if (segments.length < 3) {
+      await logInfo(`分片抽检 分片过少(${segments.length})，判为无效`);
+      return { ok: false, segBytes: 0 };
+    }
+    let okCount = 0;
+    let segBytes = 0;
+    for (const seg of segments.slice(0, 1)) {
+      try {
+        const res = await OmniBox.request(seg, {
+          method: "GET",
+          headers: { "User-Agent": UA, Range: "bytes=0-2047" },
+        });
+        const ok = res.statusCode >= 200 && res.statusCode < 300;
+        const size = Number(res.headers && (res.headers["content-range"] || "").split("/").pop()) || 0;
+        if (ok) {
+          okCount++;
+          if (size > segBytes) segBytes = size;
+        }
+        await logInfo(`分片抽检 ${res.statusCode} ${ok ? "可用" : "缺失"} ${seg.slice(0, 100)}`);
+      } catch (e) {
+        await logInfo(`分片抽检异常: ${e.message}`);
+      }
+    }
+    return { ok: okCount > 0, segBytes };
+  } catch (e) {
+    await logInfo(`播放列表解析失败: ${e.message}`);
+    return { ok: false, segBytes: 0 };
+  }
+}
+
+// 详情页里 sid -> 线路名的解析已并入 findAltDirects，避免重复请求详情页
+
+// 当前集在其他线路里的直链：同 nid 换 sid 取 player_aaaa，并发取页面 + 并发抽检，
+// 返回所有可用线路（不再只取第一条——用户嫌卡时可以直接换线）
+async function findAltDirects(videoId, nid, excludeSid, limit = 3) {
   try {
     const detailUrl = `${HOST}/detail/${videoId}.html`;
     const html = await httpGet(detailUrl);
     const $ = cheerio.load(html);
-    const sids = [];
-    $("a.mx-anthology-link[href]").each((_, el) => {
-      const m = String($(el).attr("href") || "").match(/\/play\/(\d+)-(\d+)-(\d+)\.html/);
-      if (!m || m[3] !== nid || m[2] === excludeSid) return;
-      if (!sids.includes(m[2])) sids.push(m[2]);
+    const labels = [];
+    $(".mx-anthology-tab .mx-anthology-tab-label").each((_, el) => labels.push(decodeHtml($(el).text())));
+    const nameBySid = {};
+    const sidOrder = [];
+    $(".mx-anthology-panel").each((idx, panel) => {
+      const href = $(panel).find("a.mx-anthology-link[href]").first().attr("href") || "";
+      const m = href.match(/\/play\/\d+-(\d+)-\d+\.html/);
+      if (!m) return;
+      nameBySid[m[1]] = labels[idx] || `线路${m[1]}`;
+      if (m[1] !== excludeSid && !sidOrder.includes(m[1])) sidOrder.push(m[1]);
     });
-    for (const sid of sids.slice(0, 4)) {
-      try {
-        const page = await httpGet(`${HOST}/play/${videoId}-${sid}-${nid}.html`, detailUrl);
-        const pm = page.match(/var player_aaaa=(\{[\s\S]*?\})<\/script>/);
-        if (!pm) continue;
-        const data = JSON.parse(pm[1]);
-        const target = String(data.url || "");
-        if (/^https?:\/\/[^\s]+\.(m3u8|mp4|flv)(\?|$)/i.test(target)) {
-          if (!(await probeStream(target))) {
-            await logInfo(`备选 sid=${sid} 分片同样缺失，继续找下一条`);
-            continue;
-          }
-          await logInfo(`换线成功 sid=${sid} nid=${nid} ${target.slice(0, 100)}`);
-          return { sid, url: target, name: `备选线路 ${sid}` };
+
+    // 上次这一部里哪几条 sid 好用，优先探它们（不用每集都把 5 条全试一遍）
+    let pref = [];
+    try {
+      const raw = await OmniBox.getCache(`zzz:altorder:v1:${videoId}`);
+      if (raw) pref = JSON.parse(raw);
+    } catch (_) {
+      pref = [];
+    }
+    if (Array.isArray(pref) && pref.length) {
+      sidOrder.sort((a, b) => {
+        const ia = pref.indexOf(a);
+        const ib = pref.indexOf(b);
+        return (ia < 0 ? 9 : ia) - (ib < 0 ? 9 : ib);
+      });
+    } else {
+      pref = [];
+    }
+
+    const pages = await Promise.all(
+      sidOrder.slice(0, pref.length ? 3 : 5).map(async (sid) => {
+        try {
+          const page = await httpGet(`${HOST}/play/${videoId}-${sid}-${nid}.html`, detailUrl);
+          const pm = page.match(/var player_aaaa=(\{[\s\S]*?\})<\/script>/);
+          if (!pm) return null;
+          const target = String(JSON.parse(pm[1]).url || "");
+          if (!/^https?:\/\/[^\s]+\.(m3u8|mp4|flv)(\?|$)/i.test(target)) return null;
+          return { sid, url: target, name: nameBySid[sid] || `线路${sid}` };
+        } catch (_) {
+          return null;
         }
+      })
+    );
+    const candidates = pages.filter(Boolean);
+    const checked = await Promise.all(
+      candidates.map(async (c) => ({ ...c, ok: (await probeStream(c.url)).ok }))
+    );
+    const usable = checked.filter((c) => c.ok).slice(0, limit);
+    for (const c of usable) await logInfo(`备选可用 sid=${c.sid} ${c.name} ${c.url.slice(0, 90)}`);
+    if (usable.length) {
+      try {
+        await OmniBox.setCache(`zzz:altorder:v1:${videoId}`, JSON.stringify(usable.map((c) => c.sid)), 900);
       } catch (_) {
-        /* 单条线路失败继续下一条 */
+        /* 写缓存失败不影响返回 */
       }
     }
+    return usable;
   } catch (e) {
-    await logInfo(`换线查找失败: ${e.message}`);
+    await logInfo(`备选线路查找失败: ${e.message}`);
   }
-  return null;
+  return [];
 }
 
 // 不要带站点 Referer：实测 svip.ryiplay18.com 带 Referer 会直接 SSL 断连（code=000），
@@ -623,19 +704,54 @@ async function play(params, context) {
         await logInfo(`play 预热跳过嗅探 sid=${sid} nid=${nid}`);
         return { urls: [{ name: entry.show || "解析", url: parseUrl }], parse: 1, header: PLAY_HEADER };
       }
+      const deadKey = `zzz:deadline:v1:${videoId}:${sid}`;
+      let knownDead = false;
+      try {
+        knownDead = !!(await OmniBox.getCache(deadKey));
+      } catch (_) {
+        /* 缓存不可用就走正常流程 */
+      }
+      if (knownDead) {
+        // 这条解析线路刚被证伪过（占位/失效流），别再白等 8~15 秒嗅探
+        const alts = await findAltDirects(videoId, nid, sid, 3);
+        if (alts.length) {
+          await logInfo(`play ${entry.show || "解析"} 已知源失效，直接给 ${alts.length} 条可用线路`);
+          return { urls: alts.map((a) => ({ name: a.name, url: a.url })), parse: 0, header: PLAY_HEADER };
+        }
+      }
       const sniffed = await sniffDirect(parseUrl);
       if (sniffed) {
         const lineName = entry.show || "解析";
         const header = { ...PLAY_HEADER, ...(sniffed.header || {}) };
-        if (await probeStream(sniffed.url)) {
+        const probe = await probeStream(sniffed.url);
+        if (probe.ok) {
+          // 4K 原片单片 8MB 左右（≈13Mbps），带宽一般的端会卡：
+          // 这类线路额外附上同集的 1080p 直链，客户端里可直接换线。
+          if (probe.segBytes >= 2.5 * 1024 * 1024) {
+            const alts = await findAltDirects(videoId, nid, sid, 2);
+            if (alts.length) {
+              await logInfo(`play ${lineName} 单片≈${(probe.segBytes / 1048576).toFixed(1)}MB，附 ${alts.length} 条 1080p 备选`);
+              return {
+                urls: [{ name: lineName, url: sniffed.url }, ...alts.map((a) => ({ name: `${a.name}（1080p）`, url: a.url }))],
+                parse: 0,
+                header,
+              };
+            }
+          }
           return { urls: [{ name: lineName, url: sniffed.url }], parse: 0, header };
         }
-        // 这集的解析流是残缺的（分片 404），换同集直链线路，坏线路放后面备查
-        const alt = await findAltDirect(videoId, nid, sid);
-        if (alt) {
+        // 这集的解析流是残缺/占位的（分片 404、302 到失效页、演示 gif），
+        // 换同集直链线路，坏线路放后面备查
+        try {
+          await OmniBox.setCache(deadKey, "1", 600);
+        } catch (_) {
+          /* 写缓存失败不影响返回 */
+        }
+        const alts = await findAltDirects(videoId, nid, sid, 3);
+        if (alts.length) {
           return {
             urls: [
-              { name: alt.name, url: alt.url },
+              ...alts.map((a) => ({ name: a.name, url: a.url })),
               { name: `${lineName}（源缺失）`, url: sniffed.url },
             ],
             parse: 0,
