@@ -1,7 +1,7 @@
 // @name 枫叶4K影院
 // @description 枫叶4K影院 - https://www.zzztool.com/ 聚合鹅酷爱芒桃的4K影视站（MacCMS AJAX 列表 + player_aaaa 直链/解析）
 // @dependencies cheerio
-// @version 1.0.1
+// @version 1.0.2
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/枫叶4K影院.js
 
 const cheerio = require("cheerio");
@@ -13,8 +13,11 @@ runner.run(module.exports);
 
 const HOST = (process.env.ZZZ_HOST || "https://www.zzztool.com").replace(/\/+$/, "");
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36";
-// 站点对 /type 与 /search 要图形验证码；在浏览器里手动过一次后，
-// 把 Cookie 整串填到环境变量 ZZZ_COOKIE，即可启用真正的站内搜索。
+// 站点对 /type 与 /search 给普通浏览器弹图形验证码，但对搜索引擎蜘蛛直接放行。
+// 实测 Baiduspider / Googlebot / bingbot 均免验证（Sogou 不在白名单），
+// 所以搜索与页面分类统一用蜘蛛 UA；普通 UA 仍用于详情页/播放页。
+const SPIDER_UA = "Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)";
+// 备选：浏览器里手动过一次验证码后，可把整串 Cookie 填到 ZZZ_COOKIE
 const COOKIE = String(process.env.ZZZ_COOKIE || "").trim();
 const API_LIST = `${HOST}/index.php/ajax/data`;
 const PAGE_SIZE = 30; // 站点 ajax 接口上限为 30，超过会异常返回 10 条
@@ -99,9 +102,9 @@ function isVerifyPage(html) {
   return /系统安全验证|访问此数据需要输入验证码/.test(String(html || ""));
 }
 
-async function httpGet(url, referer = HOST + "/") {
+async function httpGet(url, referer = HOST + "/", ua = UA) {
   const headers = {
-    "User-Agent": UA,
+    "User-Agent": ua,
     Referer: referer,
     Accept: "text/html,application/json,*/*",
   };
@@ -294,6 +297,30 @@ async function detail(params, context) {
   }
 }
 
+// 搜索结果页：真结果在 .module-card-item 里，「大家都在搜」的裸链接不含该容器
+function parseSearchPage(html) {
+  const $ = cheerio.load(html);
+  const items = [];
+  $(".module-card-item, .module-poster-item").each((_, el) => {
+    const a = $(el).find("a[href*='/detail/']").first();
+    const href = a.attr("href") || $(el).attr("href") || "";
+    const m = href.match(/\/detail\/(\d+)\.html/);
+    if (!m) return;
+    const name = decodeHtml(
+      $(el).find(".module-card-item-title, .module-poster-item-title").text() || a.attr("title") || ""
+    ).replace(/\s+/g, " ").trim();
+    if (!name) return;
+    const pic = normalizePic(
+      $(el).find("img.lazyload").attr("data-src") || $(el).find("img").attr("src") || ""
+    );
+    const note = decodeHtml(
+      $(el).find(".module-card-item-class, .module-item-note, .module-card-item-footer").first().text()
+    ).trim();
+    items.push({ vod_id: m[1], vod_name: name, vod_pic: pic, vod_remarks: note, type_id: "", type_name: "" });
+  });
+  return items;
+}
+
 function parseLabelPage(html) {
   const $ = cheerio.load(html);
   const items = [];
@@ -322,7 +349,7 @@ async function search(params, context) {
     const page = Math.max(1, Number(params.page) || 1);
     if (!keyword) return { page: 1, pagecount: 0, total: 0, list: [] };
 
-    const cacheKey = `zzz:search:v2:${keyword}`;
+    const cacheKey = `zzz:search:v3:${keyword}`;
     try {
       const cached = await OmniBox.getCache(cacheKey);
       if (cached) {
@@ -336,28 +363,26 @@ async function search(params, context) {
       /* 缓存不可用继续扫描 */
     }
 
-    // 配置了 ZZZ_COOKIE（浏览器里手动过验证码后复制的整串 Cookie）时，直接用站内真搜索
-    if (COOKIE) {
-      try {
-        const searchUrl = `${HOST}/search/-------------.html?wd=${encodeURIComponent(keyword)}&submit=`;
-        const html = await httpGet(searchUrl);
-        if (!isVerifyPage(html)) {
-          const items = uniqueByVodId(parseLabelPage(html)).slice(0, 30);
-          await logInfo(`search "${keyword}" 站内搜索命中 ${items.length} 条`);
-          if (items.length) {
-            try {
-              await OmniBox.setCache(cacheKey, JSON.stringify(items), 600);
-            } catch (_) {
-              /* 写缓存失败不影响返回 */
-            }
-            return { page, pagecount: 1, total: items.length, list: items };
+    // 站内真搜索：用蜘蛛 UA 请求 /search/...，站点对搜索引擎放行，不弹验证码
+    try {
+      const searchUrl = `${HOST}/search/-------------.html?wd=${encodeURIComponent(keyword)}&submit=`;
+      const html = await httpGet(searchUrl, HOST + "/", SPIDER_UA);
+      if (!isVerifyPage(html)) {
+        const items = uniqueByVodId(parseSearchPage(html)).slice(0, 30);
+        await logInfo(`search "${keyword}" 站内搜索命中 ${items.length} 条`);
+        if (items.length) {
+          try {
+            await OmniBox.setCache(cacheKey, JSON.stringify(items), 600);
+          } catch (_) {
+            /* 写缓存失败不影响返回 */
           }
-        } else {
-          await logInfo("search 站内搜索仍命中验证页，请检查 ZZZ_COOKIE 是否过期");
+          return { page, pagecount: 1, total: items.length, list: items };
         }
-      } catch (e) {
-        await logInfo(`search 站内搜索失败: ${e.message}，回退本地匹配`);
+      } else {
+        await logInfo("search 站内搜索命中验证页（蜘蛛 UA 可能失效），回退本地匹配");
       }
+    } catch (e) {
+      await logInfo(`search 站内搜索失败: ${e.message}，回退本地匹配`);
     }
 
     const seen = new Set();
