@@ -1,8 +1,8 @@
 // @name 网盘九站聚合
 // @author @Tao_XG
-// @description 聚合玩偶、木偶、蜡笔、闪电、多多、欧哥、花卷、虎斑、小斑；24 个主备入口，同名搜索合并，支持网盘展开、刮削、弹幕和播放
+// @description 聚合玩偶、木偶、蜡笔、闪电、多多、欧哥、花卷、虎斑、小斑；24 个主备入口，同名搜索合并，仅保留115/阿里/百度/光鸭资源，支持网盘展开、刮削、弹幕和播放
 // @dependencies axios,cheerio
-// @version 1.1.1
+// @version 1.2.0
 // @downloadURL https://raw.githubusercontent.com/tardlk/OmniBox-Spider/main/影视/网盘/网盘九站聚合.js
 // 基于 tardlk/OmniBox-Spider 的玩偶聚合-非分组 v1.0.1。
 
@@ -39,7 +39,8 @@ const FILTER_CONFIG_BASE_URL = "https://gh-proxy.org/https://github.com/tardlk/O
 // 网盘线路优先级（从高到低），可用环境变量 PAN_DRIVE_ORDER 覆盖（分号/逗号分隔，如 115;baidu;quark;uc）
 // 注意：内部 key 为 baidu/quark/a139/a189/a123/a115/xunlei/ali/uc，环境变量里可写 115/189/123/139 简写
 const LINE_ORDER_ALIAS = { "115": "a115", "189": "a189", "123": "a123", "139": "a139" };
-const LINE_ORDER = (process.env.PAN_DRIVE_ORDER || "baidu;a139;a189;a123;a115;quark;xunlei;ali;uc")
+const ALLOWED_DRIVE_KEYS = new Set(["a115", "ali", "baidu", "guangya"]);
+const LINE_ORDER = (process.env.PAN_DRIVE_ORDER || "a115;ali;baidu;guangya")
   .split(/[;,]/)
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean)
@@ -423,13 +424,16 @@ async function requestWithFailover(domains, path, options = {}) {
   let lastError = null;
   const { budgetMs, ...requestOptions } = options;
   const effectiveBudget = Number.isFinite(budgetMs) && budgetMs > 0 ? budgetMs : 30000;
-  const perDomainTimeout = Math.max(1000, Math.floor(effectiveBudget / Math.max(1, domains.length)));
+  const perDomainTimeout = Math.max(1, Math.floor(effectiveBudget / Math.max(1, domains.length)));
+  const deadline = Date.now() + effectiveBudget;
 
   const requestPath = /^https?:\/\//i.test(path)
     ? new URL(path).pathname + new URL(path).search
     : path;
 
   for (let i = 0; i < domains.length; i++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
     const baseUrl = removeTrailingSlash(domains[i]);
     const fullUrl = new URL(requestPath, `${baseUrl}/`).href;
 
@@ -442,7 +446,7 @@ async function requestWithFailover(domains, path, options = {}) {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
           ...(requestOptions.headers || {}),
         },
-        timeout: requestOptions.timeout ?? perDomainTimeout,
+        timeout: Math.max(1, Math.min(requestOptions.timeout ?? perDomainTimeout, remaining)),
       });
 
       if (response.statusCode === 200 && response.body) {
@@ -714,7 +718,18 @@ function extractPanUrl(raw) {
 }
 
 function isPanShareUrl(url = "") {
-  return /115|quark|aliyun|alipan|baidu|uc\.cn|123pan|189\.cn|xunlei|anxia/i.test(String(url || ""));
+  return detectDriveKey(url) !== "other";
+}
+
+function isAllowedShareUrl(url = "") {
+  if (!ALLOWED_DRIVE_KEYS.has(detectDriveKey(url))) return false;
+  try {
+    const { pathname } = new URL(url);
+    return /^\/s\/[^/]+/i.test(pathname) ||
+      (detectDriveKey(url) === "baidu" && /^\/share\/(?:init|link)(?:\/|$)/i.test(pathname));
+  } catch (_) {
+    return false;
+  }
 }
 
 function extractPanUrlsFromDetail($, site) {
@@ -722,7 +737,7 @@ function extractPanUrlsFromDetail($, site) {
   const seen = new Set();
   const pushUrl = (raw) => {
     const url = extractPanUrl(raw);
-    if (!url || !/^https?:\/\//i.test(url) || !isPanShareUrl(url)) return;
+    if (!url || !/^https?:\/\//i.test(url) || !isAllowedShareUrl(url)) return;
     if (seen.has(url)) return;
     seen.add(url);
     panUrls.push(url);
@@ -748,16 +763,12 @@ function extractPanUrlsFromDetail($, site) {
     $(selector).each((_, p) => pushUrl($(p).text().trim()));
   }
 
-  // 兜底：整页扫描分享链接（含 115cdn/anxia）
-  if (panUrls.length === 0) {
-    const html = $.html() || "";
-    const re =
-      /https?:\/\/(?:115cdn\.com|115\.com|anxia\.com|pan\.quark\.cn|www\.aliyundrive\.com|www\.alipan\.com|pan\.baidu\.com|drive\.uc\.cn|cloud\.189\.cn|www\.123pan\.com|pan\.xunlei\.com)\/[^\s"'<>]+/gi;
-    let m;
-    while ((m = re.exec(html))) {
-      pushUrl(m[0]);
-    }
-  }
+  // 补齐 href / clipboard 中的分享；即使正文已命中一种网盘，也要保留其它允许的网盘。
+  // 所有候选均经过严格 host 和分享路径校验，图片、导航链接和伪造域名不会进入结果。
+  const html = $.html() || "";
+  const re = /https?:\/\/[^\s"'<>]+/gi;
+  let match;
+  while ((match = re.exec(html))) pushUrl(match[0]);
 
   return panUrls;
 }
@@ -1085,6 +1096,36 @@ for (const arr of resultsArrays) {
   return list;
 }
 
+async function filterSearchResultsByDrive(list) {
+  const budgetMs = Number.isFinite(SEARCH_TIMEOUT_BUDGET_MS) && SEARCH_TIMEOUT_BUDGET_MS > 0
+    ? SEARCH_TIMEOUT_BUDGET_MS : 6000;
+  const deadline = Date.now() + budgetMs;
+  const checked = await runWithConcurrency(list, 4, async (item) => {
+    const matches = decodeMergeId(item.vod_id) || [];
+    for (const match of matches) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return null;
+      const site = SITES.find((entry) => entry.id === match.siteId);
+      if (!site) continue;
+      try {
+        const detail = await fetchSiteDetail(site, match.href, { budgetMs: remaining });
+        const allowed = detail.panUrls.filter(isAllowedShareUrl);
+        if (allowed.length) {
+          const names = { a115: "115", ali: "阿里", baidu: "百度", guangya: "光鸭" };
+          const types = [...new Set(allowed.map(detectDriveKey))].map((key) => names[key]);
+          return { ...item, vod_remarks: `${types.join("/")} · ${item.vod_remarks || ""}` };
+        }
+      } catch (error) {
+        await OmniBox.log("warn", `[search-filter] ${site.name} 校验失败: ${error.message}`);
+      }
+    }
+    return null;
+  });
+  const filtered = checked.filter(Boolean);
+  await OmniBox.log("info", `[search-filter] 仅保留115/阿里/百度/光鸭: input=${list.length}, kept=${filtered.length}`);
+  return filtered;
+}
+
 function getSiteOrderIndex(siteId) {
   if (PAN_SITE_ORDER.length > 0) {
     const idx = PAN_SITE_ORDER.indexOf(String(siteId || "").toLowerCase());
@@ -1176,6 +1217,17 @@ async function fetchSiteCategoryList(site, categoryId, page = 1, filters = {}) {
 }
 
 async function fetchSiteDetail(site, videoId, options = {}) {
+  const key = buildCacheKey("nine:detail:v120", `${site.id}:${videoId}`);
+  const cached = await getCachedJSON(key);
+  if (cached && Array.isArray(cached.panUrls)) {
+    return { ...cached, panUrls: cached.panUrls.filter(isAllowedShareUrl) };
+  }
+  const data = await fetchSiteDetailUncached(site, videoId, options);
+  await setCachedJSON(key, data, 300);
+  return data;
+}
+
+async function fetchSiteDetailUncached(site, videoId, options = {}) {
   const { response, baseUrl } = await requestWithFailover(site.domains, videoId, { budgetMs: options.budgetMs });
   const $ = cheerio.load(response.body);
 
@@ -1467,7 +1519,7 @@ async function handleSiteDetail(vodId, drives, context) {
 
   const { vodName, vodPic, vodYear, vodDirector, vodActor, vodContent, panUrls } = await fetchSiteDetail(site, rawId);
 
-  const panItems = panUrls.map((panUrl) => ({ url: panUrl, driveKey: detectDriveKey(panUrl) }));
+  const panItems = panUrls.filter(isAllowedShareUrl).map((panUrl) => ({ url: panUrl, driveKey: detectDriveKey(panUrl) }));
   panItems.sort((a, b) => compareDriveKeyOrder(a.driveKey, b.driveKey));
 
   let playSources = [];
@@ -1569,7 +1621,7 @@ async function handleMergedDetail(vodId, drives, context) {
     if (!metadata.vodActor) metadata.vodActor = detailData.vodActor;
     if (!metadata.vodContent) metadata.vodContent = detailData.vodContent;
 
-    for (const panUrl of detailData.panUrls) {
+    for (const panUrl of detailData.panUrls.filter(isAllowedShareUrl)) {
       panItems.push({ url: panUrl, driveKey: detectDriveKey(panUrl), siteId: site.id, siteName: site.name });
       totalPanCount++;
     }
@@ -1655,21 +1707,26 @@ async function handleMergedDetail(vodId, drives, context) {
 }
 
 function detectDriveKey(panUrl) {
-  const url = String(panUrl || "").toLowerCase();
-  if (url.includes("pan.baidu.com")) return "baidu";
-  if (url.includes("quark.cn")) return "quark";
-  if (url.includes("115.com") || url.includes("115cdn.com") || url.includes("anxia.com")) return "a115";
-  if (url.includes("123pan.com")) return "a123";
-  if (url.includes("189.cn")) return "a189";
-  if (url.includes("139.com")) return "a139";
-  if (url.includes("aliyundrive.com") || url.includes("alipan.com")) return "ali";
-  if (url.includes("xunlei.com")) return "xunlei";
-  if (url.includes("uc.cn")) return "uc";
+  let host;
+  try { host = new URL(String(panUrl || "")).hostname.toLowerCase(); }
+  catch (_) { return "other"; }
+  const matches = (domain) => host === domain || host.endsWith(`.${domain}`);
+  if (matches("pan.baidu.com")) return "baidu";
+  if (matches("quark.cn")) return "quark";
+  if (["115.com", "115cdn.com", "anxia.com"].some(matches)) return "a115";
+  if (matches("123pan.com")) return "a123";
+  if (matches("189.cn")) return "a189";
+  if (matches("139.com")) return "a139";
+  if (matches("aliyundrive.com") || matches("alipan.com")) return "ali";
+  if (matches("guangyapan.com")) return "guangya";
+  if (matches("xunlei.com")) return "xunlei";
+  if (matches("uc.cn")) return "uc";
   return "other";
 }
 
 function inferDriveTypeFromSourceName(name = "") {
   const raw = String(name || "").toLowerCase();
+  if (raw.includes("光鸭") || raw.includes("光雅") || raw.includes("guangya")) return "guangya";
   if (raw.includes("百度")) return "baidu";
   if (raw.includes("139")) return "a139";
   if (raw.includes("天翼") || raw.includes("189")) return "a189";
@@ -2053,7 +2110,7 @@ async function search(params, context) {
     const resultsArrays = await Promise.all(
       SITES.map((site) => fetchSiteSearch(site, keyword, page, { budgetMs: SEARCH_TIMEOUT_BUDGET_MS }))
     );
-    const allResults = mergeSearchResults(resultsArrays);
+    const allResults = await filterSearchResultsByDrive(mergeSearchResults(resultsArrays));
     await OmniBox.log("info", `[search] mergedTotal=${allResults.length}`);
     return { list: allResults, page, pagecount: 1, total: allResults.length };
   } catch (error) {
@@ -2078,6 +2135,7 @@ async function play(params, context) {
       if (match) {
         const [, driveKey, encodedUrl] = match;
         const url = decodeURIComponent(encodedUrl);
+        if (!isAllowedShareUrl(url)) return { urls: [], header: {}, parse: 0, danmaku: [] };
         const drive = drives.find((o) => o.key === driveKey);
         if (drive) {
           try {
@@ -2093,6 +2151,7 @@ async function play(params, context) {
     if (parts.length < 2) return { urls: [], header: {}, danmaku: [] };
 
     const shareURL = parts[0];
+    if (!isAllowedShareUrl(shareURL)) return { urls: [], header: {}, parse: 0, danmaku: [] };
     const fileId = parts[1];
     const rawScrapeKey = parts[2] || "";
     const fallbackDanmakuFileName = parts[3] ? decodeURIComponent(parts[3]) : "";
