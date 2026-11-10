@@ -1,8 +1,8 @@
 // @name Gimy剧迷
 // @author 梦
-// @description 影视站：Gimy / gimy.now / gimyai.tw，支持首页、分类、详情、搜索与播放页嗅探
+// @description 影视站：Gimy / gimy.now / gimyai.tw，支持首页、分类、详情、搜索与播放解析
 // @dependencies cheerio,opencc-js
-// @version 1.2.7
+// @version 2.0.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/Gimy剧迷.js
 
 const OmniBox = require("omnibox_sdk");
@@ -10,6 +10,22 @@ const runner = require("spider_runner");
 const cheerio = require("cheerio");
 
 // ==================== 配置开始 ====================
+// ⚠️ Cloudflare：站点（gimyai.tw / aigm.tv / gmtv.app）对人机验证要求很高，
+// 脚本的裸请求会直接拿到 403 + 「Just a moment...」。若浏览器能正常打开站点，
+// 把浏览器里的 Cookie 粘到下面（或设环境变量 GIMY_COOKIE），脚本就能带上它请求。
+//
+// 取法（Edge/Chrome）：
+//   1. 打开 https://gimyai.tw/ ，等页面完全正常显示（不再显示「請稍候...」）
+//   2. F12 → Application（应用）→ Cookies → https://gimyai.tw
+//   3. 至少复制 cf_clearance 的值；保险起见把整条 Cookie 串都复制过来
+//   4. 粘贴到 CF_COOKIE，形如：cf_clearance=xxxx; __cf_bm=yyyy;
+//   5. 如果站点识别 UA，把浏览器的 UA 整串贴到 CF_UA（留空则用内置 UA）
+//
+// 注意：cf_clearance 与「出口 IP + User-Agent」绑定，一般 30 分钟~几小时过期。
+//   只有 OmniBox 和浏览器走同一个出口 IP 时才能复用；过期后重新复制一次即可。
+const CF_COOKIE = String(process.env.GIMY_COOKIE || "").trim();
+const CF_UA = String(process.env.GIMY_UA || "").trim();
+
 // 是否禁用 OpenCC 等外部繁简转换库；环境变量 GIMY_DISABLE_OPENCC=1 时仅使用内置兜底映射。
 const DISABLE_OPENCC = String(process.env.GIMY_DISABLE_OPENCC || "").trim() === "1";
 
@@ -20,7 +36,8 @@ const PLAY_SOURCE_ORDER_CONFIG = String(process.env.GIMY_PLAY_SOURCE_ORDER || pr
 const BASE_URL = "https://gimyai.tw";
 
 // 请求使用的 User-Agent，避免站点返回移动端或拦截页面。
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+// 带 cf_clearance 时必须与浏览器一致，否则一样 403。
+const UA = CF_UA || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0";
 
 // 未设置播放线路排序环境变量时的默认优先线路，未命中的线路保持站点原始顺序。
 const DEFAULT_PLAY_SOURCE_ORDER = ["4K画质线路 ᴴᴰ", "超清线路 ᴴᴰ"];
@@ -39,24 +56,53 @@ function getBodyText(res) {
   return String(body || "");
 }
 
+function isCloudflareChallenge(text) {
+  const html = String(text || "");
+  return /Just a moment|cf-mitigated|cf_chl_opt|challenge-platform|請稍候|请稍候|Attention Required/i.test(html);
+}
+
+function cfError(url) {
+  const err = new Error(
+    CF_COOKIE
+      ? `Cloudflare 人机验证未通过(HTTP 403) @ ${url} —— CF_COOKIE 可能已过期或与当前出口 IP/UA 不匹配`
+      : `Cloudflare 人机验证(HTTP 403) @ ${url} —— 请在脚本顶部 CF_COOKIE 填入浏览器 Cookie`
+  );
+  err.cfChallenge = true;
+  return err;
+}
+
 async function requestText(url, options = {}) {
-  await OmniBox.log("info", `[Gimy剧迷][request] ${options.method || "GET"} ${url}`);
+  const headers = {
+    "User-Agent": UA,
+    "Accept-Language": "zh-TW,zh;q=0.9,zh-CN;q=0.8,en;q=0.7",
+    Accept: options.accept || "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": options.fetchDest || "document",
+    "Sec-Fetch-Mode": options.fetchMode || "navigate",
+    "Sec-Fetch-Site": options.fetchSite || "same-origin",
+    Referer: options.referer || `${BASE_URL}/`,
+    ...(options.headers || {}),
+  };
+  if (CF_COOKIE) headers.Cookie = CF_COOKIE;
+
+  await OmniBox.log("info", `[Gimy剧迷][request] ${options.method || "GET"} ${url}${CF_COOKIE ? " (with cookie)" : ""}`);
   const res = await OmniBox.request(url, {
     method: options.method || "GET",
-    headers: {
-      "User-Agent": UA,
-      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      Referer: options.referer || `${BASE_URL}/`,
-      ...(options.headers || {}),
-    },
+    headers,
     body: options.body,
     timeout: options.timeout || 20000,
   });
   const statusCode = Number(res?.statusCode || 0);
+  const text = getBodyText(res);
   if (!res || statusCode !== 200) {
+    if ((statusCode === 403 || statusCode === 503) && isCloudflareChallenge(text)) throw cfError(url);
     throw new Error(`HTTP ${res?.statusCode || "unknown"} @ ${url}`);
   }
-  return getBodyText(res);
+  if (isCloudflareChallenge(text) && text.length < 20000) throw cfError(url);
+  return text;
 }
 
 function absUrl(url) {
@@ -540,99 +586,200 @@ async function search(params, context) {
   }
 }
 
+// ---------- 播放解析 ----------
+// 说明：旧版走的 play.gimyai.tw（/v/、/d/、/n/ 下的 parse.php）已经整域没有 DNS 解析，
+// 这里改成「页内数据 → 页内直链 → 同源解析接口 → iframe 内层 → 嗅探」的阶梯，逐级回退。
+const MEDIA_RE = /https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mp4|flv)(?:\?[^\s"'<>\\]*)?/gi;
+
+// 只认「路径本身」是视频后缀的地址：解析页常见 .../v/?url=https%3A%2F%2Fx.mp4 这种尾巴，
+// 直接当直链会把整个 iframe 页丢给播放器。
+function isDirectMedia(url) {
+  const value = String(url || "").trim();
+  if (!/^https?:\/\//i.test(value)) return false;
+  const path = value.split("?")[0].split("#")[0];
+  return /\.(m3u8|mp4|flv)$/i.test(path);
+}
+
+function pickMediaUrl(text) {
+  const normalized = String(text || "").replace(/\\\//g, "/");
+  const re = new RegExp(MEDIA_RE.source, "gi");
+  let m;
+  while ((m = re.exec(normalized)) !== null) {
+    const candidate = m[0];
+    if (/[?&](url|u|v|link|jx)=/i.test(candidate)) continue;
+    if (!isDirectMedia(candidate)) continue;
+    return candidate;
+  }
+  return "";
+}
+
+function parseInlinePlayer(html) {
+  const text = String(html || "");
+  const patterns = [
+    /var\s+player_data\s*=\s*(\{[\s\S]*?\})\s*(?:;|<\/script>)/i,
+    /var\s+player_aaaa\s*=\s*(\{[\s\S]*?\})\s*(?:;|<\/script>)/i,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (!m) continue;
+    try {
+      return JSON.parse(m[1].replace(/\\\//g, "/"));
+    } catch (_) {}
+  }
+  return null;
+}
+
+function extractIframe(html) {
+  const m = String(html || "").match(/<iframe[^>]+src=["']([^"']+)["']/i);
+  if (!m) return "";
+  return absUrl(m[1].replace(/&amp;/g, "&"));
+}
+
+function buildPlayResult(url, from, referer) {
+  const header = { "User-Agent": UA, Referer: referer || `${BASE_URL}/`, Origin: BASE_URL };
+  return {
+    parse: 0,
+    url,
+    urls: [{ name: toDisplayText(from) || "直链播放", url }],
+    header,
+    headers: header,
+  };
+}
+
+async function tryParseEndpoint(rawUrl, from, referer) {
+  const paths = [];
+  if (from === "NSYS") paths.push("/n/");
+  if (/^JD/.test(from)) paths.push("/d/");
+  paths.push("/v/", "/d/", "/");
+
+  const tried = new Set();
+  for (const p of paths) {
+    if (tried.has(p)) continue;
+    tried.add(p);
+    const parseUrl = `${BASE_URL}${p}parse.php?url=${encodeURIComponent(rawUrl)}`
+      + (from ? `&jctype=${encodeURIComponent(from)}` : "")
+      + (p === "/n/" ? `&next=${encodeURIComponent(referer)}` : "")
+      + `&_t=${Date.now()}`;
+    try {
+      const text = await requestText(parseUrl, {
+        referer: `${BASE_URL}${p}?url=${encodeURIComponent(rawUrl)}`,
+        accept: "application/json, text/plain, */*",
+        fetchMode: "cors",
+        fetchDest: "empty",
+        timeout: 10000,
+      });
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch (_) {}
+      const candidate = String(
+        (json && (json.url || json.video || json.playurl || (json.data && json.data.url))) || ""
+      ).trim() || pickMediaUrl(text);
+      if (/^https?:\/\//i.test(candidate)) {
+        await OmniBox.log("info", `[Gimy剧迷][play] parse 命中 ${p} -> ${candidate.slice(0, 120)}`);
+        return candidate;
+      }
+      await OmniBox.log("warn", `[Gimy剧迷][play] parse ${p} 无地址: ${String(text).slice(0, 100)}`);
+    } catch (e) {
+      await OmniBox.log("warn", `[Gimy剧迷][play] parse ${p} 失败: ${e.message}`);
+    }
+  }
+  return "";
+}
+
+async function resolveIframe(iframeUrl, referer, depth) {
+  if (!iframeUrl || depth > 1) return "";
+  try {
+    await OmniBox.log("info", `[Gimy剧迷][play] 进 iframe(depth=${depth}) ${iframeUrl.slice(0, 150)}`);
+    const html = await requestText(iframeUrl, { referer, timeout: 12000 });
+
+    const direct = pickMediaUrl(html);
+    if (direct) return direct;
+
+    const data = parseInlinePlayer(html);
+    if (data && data.url) {
+      const rawUrl = String(data.url).replace(/\\\//g, "/");
+      if (isDirectMedia(rawUrl)) return rawUrl;
+      const parsed = await tryParseEndpoint(rawUrl, String(data.from || ""), iframeUrl);
+      if (parsed) return parsed;
+    }
+
+    const nextIframe = extractIframe(html);
+    if (nextIframe && nextIframe !== iframeUrl) return resolveIframe(nextIframe, iframeUrl, depth + 1);
+  } catch (e) {
+    await OmniBox.log("warn", `[Gimy剧迷][play] iframe 解析失败: ${e.message}`);
+  }
+  return "";
+}
+
 async function play(params, context) {
   try {
     const playId = String(params.playId || params.id || params.url || "").trim();
     if (!playId) return { parse: 0, urls: [], url: "", header: {}, headers: {} };
 
+    if (isDirectMedia(playId)) {
+      return buildPlayResult(playId, "直链", `${BASE_URL}/`);
+    }
+
     const pageUrl = /^https?:\/\//i.test(playId) ? playId : absUrl(playId);
-    const baseHeaders = { "User-Agent": UA, "Referer": pageUrl, "Origin": BASE_URL };
+    const baseHeaders = { "User-Agent": UA, Referer: pageUrl, Origin: BASE_URL };
     await OmniBox.log("info", `[Gimy剧迷][play] start pageUrl=${pageUrl}`);
 
-    let playerData = null;
+    let html = "";
     try {
-      const html = await requestText(pageUrl, { referer: pageUrl });
-      const m = html.match(/var\s+player_data\s*=\s*(\{[\s\S]*?\})\s*<\/script>/i);
-      if (m) {
-        await OmniBox.log("info", `[Gimy剧迷][play] player_data=${m[1].slice(0, 500)}`);
-        playerData = JSON.parse(m[1]);
-      }
+      html = await requestText(pageUrl, { referer: `${BASE_URL}/`, timeout: 15000 });
     } catch (e) {
       await OmniBox.log("warn", `[Gimy剧迷][play] 读取播放页失败: ${e.message}`);
     }
 
-    if (playerData && playerData.url) {
-      const rawUrl = String(playerData.url || "");
-      const playFrom = String(playerData.from || "");
-      let parseBase = "https://play.gimyai.tw/v/";
-      let referer = `https://play.gimyai.tw/v/?url=${encodeURIComponent(rawUrl)}`;
+    if (html) {
+      // 1) 页内 player 数据（macCMS 的 player_aaaa / 站方 player_data）
+      const player = parseInlinePlayer(html);
+      if (player && player.url) {
+        const rawUrl = String(player.url).replace(/\\\//g, "/");
+        const from = String(player.from || "");
+        await OmniBox.log("info", `[Gimy剧迷][play] player 数据 url=${rawUrl.slice(0, 130)} from=${from}`);
+        if (isDirectMedia(rawUrl)) return buildPlayResult(rawUrl, from || "直链", pageUrl);
 
-      if (["JD4K", "JD2K", "JDHG", "JDQM"].includes(playFrom)) {
-        parseBase = "https://play.gimyai.tw/d/";
-        referer = `https://play.gimyai.tw/d/?url=${encodeURIComponent(rawUrl)}&jctype=${encodeURIComponent(playFrom)}&next=${encodeURIComponent(`//${pageUrl}`)}`;
-      } else if (playFrom === "NSYS") {
-        parseBase = "https://play.gimyai.tw/n/";
-        referer = `https://play.gimyai.tw/n/?url=${encodeURIComponent(rawUrl)}&jctype=${encodeURIComponent(playFrom)}&next=${encodeURIComponent(pageUrl)}`;
+        const parsed = await tryParseEndpoint(rawUrl, from, pageUrl);
+        if (parsed) return buildPlayResult(parsed, from || "解析线路", pageUrl);
+
+        // 站外的解析页：当成 iframe 再挖一层
+        if (/^https?:\/\//i.test(rawUrl) && !/(^|\.)gimyai\.tw|(^|\.)aigm\.tv|(^|\.)gmtv\.app/i.test(rawUrl)) {
+          const inner = await resolveIframe(rawUrl, pageUrl, 0);
+          if (inner) return buildPlayResult(inner, from || "解析线路", pageUrl);
+        }
       }
 
-      const parseUrl = `${parseBase}parse.php?url=${encodeURIComponent(rawUrl)}&_t=${Date.now()}`;
-      await OmniBox.log("info", `[Gimy剧迷][play] parseUrl=${parseUrl}`);
+      // 2) 页内直接写死的 m3u8/mp4
+      const inline = pickMediaUrl(html);
+      if (inline) {
+        await OmniBox.log("info", `[Gimy剧迷][play] 页内直链 ${inline.slice(0, 130)}`);
+        return buildPlayResult(inline, "页内直链", pageUrl);
+      }
 
-      try {
-        const parseText = await requestText(parseUrl, {
-          referer,
-          headers: {
-            Accept: "application/json, text/plain, */*",
-          },
-        });
-        await OmniBox.log("info", `[Gimy剧迷][play] parseResponse=${parseText.slice(0, 500)}`);
-        let parseJson = null;
-        try {
-          parseJson = JSON.parse(parseText);
-        } catch (_) {}
-
-        const mediaUrl = String(parseJson?.url || parseJson?.video || parseJson?.playurl || "").trim();
-        const mediaType = String(parseJson?.type || "").trim();
-        if (mediaUrl) {
-          const header = {
-            "User-Agent": UA,
-            Referer: referer,
-            Origin: new URL(parseBase).origin,
-          };
-          return {
-            parse: 0,
-            url: mediaUrl,
-            urls: [{ name: toDisplayText(playFrom) || "直链播放", url: mediaUrl }],
-            header,
-            headers: header};
-        }
-      } catch (e) {
-        await OmniBox.log("warn", `[Gimy剧迷][play] parse.php failed: ${e.message}`);
+      // 3) iframe 内层
+      const iframe = extractIframe(html);
+      if (iframe) {
+        const inner = await resolveIframe(iframe, pageUrl, 0);
+        if (inner) return buildPlayResult(inner, "iframe", pageUrl);
       }
     }
 
+    // 4) 嗅探兜底
     try {
-      const sniffed = await OmniBox.sniffVideo(pageUrl, { "User-Agent": UA, "Referer": pageUrl });
-      await OmniBox.log("info", `[Gimy剧迷][play] sniff result=${JSON.stringify(sniffed || {})}`);
+      const sniffed = await OmniBox.sniffVideo(pageUrl, { "User-Agent": UA, Referer: pageUrl });
+      await OmniBox.log("info", `[Gimy剧迷][play] sniff=${JSON.stringify(sniffed || {}).slice(0, 200)}`);
       if (sniffed && sniffed.url) {
         const header = sniffed.header || baseHeaders;
-        return {
-          parse: 0,
-          url: sniffed.url,
-          urls: [{ name: "嗅探播放", url: sniffed.url }],
-          header,
-          headers: header};
+        return { parse: 0, url: sniffed.url, urls: [{ name: "嗅探播放", url: sniffed.url }], header, headers: header };
       }
     } catch (e) {
       await OmniBox.log("warn", `[Gimy剧迷][play] sniffVideo failed: ${e.message}`);
     }
 
-    return {
-      parse: 1,
-      url: pageUrl,
-      urls: [{ name: "播放页", url: pageUrl }],
-      header: baseHeaders,
-      headers: baseHeaders};
+    await OmniBox.log("warn", "[Gimy剧迷][play] 未解析到直链，回退播放页");
+    return { parse: 1, url: pageUrl, urls: [{ name: "播放页", url: pageUrl }], header: baseHeaders, headers: baseHeaders };
   } catch (e) {
     await OmniBox.log("error", `[Gimy剧迷][play] ${e.message}`);
     return { parse: 0, urls: [], url: "", header: {}, headers: {} };
