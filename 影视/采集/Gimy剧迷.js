@@ -1,8 +1,8 @@
 // @name Gimy剧迷
 // @author 梦
-// @description 影视站：Gimy / gimy.now / gimyai.tw，支持首页、分类、详情、搜索与播放解析
+// @description 影视站：Gimy / gimyai.tw（MacCMS v10 新版模板），首页、分类筛选、AJAX 搜索、多线路播放
 // @dependencies cheerio,opencc-js
-// @version 2.0.0
+// @version 2.1.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/Gimy剧迷.js
 
 const OmniBox = require("omnibox_sdk");
@@ -400,48 +400,64 @@ function extractCards($, scope) {
   return list;
 }
 
+// ==================== 分类 / 筛选 ====================
+// 站点是 MacCMS v10 改版模板，分类 id 见下方（來自站方欄目與第三方實現的實際取值）。
+const CATEGORIES = [
+  { type_id: "1", type_name: "電影" },
+  { type_id: "2", type_name: "電視劇" },
+  { type_id: "13", type_name: "陸劇" },
+  { type_id: "20", type_name: "韓劇" },
+  { type_id: "16", type_name: "美劇" },
+  { type_id: "15", type_name: "日劇" },
+  { type_id: "14", type_name: "台劇" },
+  { type_id: "21", type_name: "港劇" },
+  { type_id: "31", type_name: "海外劇" },
+  { type_id: "4", type_name: "動漫" },
+  { type_id: "29", type_name: "綜藝" },
+  { type_id: "34", type_name: "短劇" },
+  { type_id: "38", type_name: "AI漫劇" },
+  { type_id: "22", type_name: "紀錄片" },
+];
+
+const AREA_FILTER = [
+  { name: "全部", value: "" }, { name: "大陸", value: "大陸" }, { name: "韓國", value: "韓國" },
+  { name: "日本", value: "日本" }, { name: "台灣", value: "台灣" }, { name: "香港", value: "香港" },
+  { name: "美國", value: "美國" }, { name: "歐美", value: "歐美" }, { name: "泰國", value: "泰國" },
+  { name: "英國", value: "英國" }, { name: "其他", value: "其他" },
+];
+
+const YEAR_FILTER = [{ name: "全部", value: "" }].concat(
+  [2026, 2025, 2024, 2023, 2022, 2021, 2020, 2019, 2018, 2017].map((y) => ({ name: String(y), value: String(y) }))
+);
+
 function buildClassAndFilters() {
-  return {
-    class: [
-      { type_id: "1", type_name: "电影" },
-      { type_id: "2", type_name: "电视剧" },
-      { type_id: "4", type_name: "动漫" },
-      { type_id: "29", type_name: "综艺" },
-      { type_id: "34", type_name: "短剧" },
-      { type_id: "13", type_name: "陆剧" },
-    ],
-    filters: {
-      "1": [
-        { key: "by", name: "排序", init: "time", value: [{ name: "最新", value: "time" }, { name: "人气", value: "hits" }, { name: "评分", value: "score" }] },
-      ],
-      "2": [
-        { key: "by", name: "排序", init: "time", value: [{ name: "最新", value: "time" }, { name: "人气", value: "hits" }, { name: "评分", value: "score" }] },
-      ],
-      "4": [
-        { key: "by", name: "排序", init: "time", value: [{ name: "最新", value: "time" }, { name: "人气", value: "hits" }, { name: "评分", value: "score" }] },
-      ],
-      "29": [
-        { key: "by", name: "排序", init: "time", value: [{ name: "最新", value: "time" }, { name: "人气", value: "hits" }, { name: "评分", value: "score" }] },
-      ],
-      "34": [
-        { key: "by", name: "排序", init: "time", value: [{ name: "最新", value: "time" }, { name: "人气", value: "hits" }, { name: "评分", value: "score" }] },
-      ],
-      "13": [
-        { key: "by", name: "排序", init: "time", value: [{ name: "最新", value: "time" }, { name: "人气", value: "hits" }, { name: "评分", value: "score" }] },
-      ],
-    },
-  };
+  const filters = {};
+  for (const cat of CATEGORIES) {
+    filters[cat.type_id] = [
+      { key: "area", name: "地區", init: "", value: AREA_FILTER },
+      { key: "year", name: "年份", init: "", value: YEAR_FILTER },
+    ];
+  }
+  return { class: CATEGORIES.map((c) => ({ type_id: c.type_id, type_name: c.type_name })), filters };
 }
 
+// /explore/{type}-{area}-{9×空}-{year}.html —— 12 段、11 个连字符，比 /genre/ 页小 7 倍
+function buildExploreUrl(typeId, area, year) {
+  const safeArea = String(area || "").trim();
+  const safeYear = String(year || "").trim();
+  const parts = [String(typeId || ""), safeArea, "", "", "", "", "", "", "", "", "", safeYear];
+  return `${BASE_URL}/explore/${parts.join("-")}.html`;
+}
+
+// ==================== 首页 ====================
 async function home(params, context) {
   try {
     getSimplifyConverter();
-    await OmniBox.log("info", `[Gimy剧迷][display] simplifyConverter=${simplifyConverterName}`);
     const config = buildClassAndFilters();
     const html = await requestText(`${BASE_URL}/`);
     const $ = cheerio.load(html);
-    const list = extractCards($).slice(0, 24);
-    await OmniBox.log("info", `[Gimy剧迷][home] 推荐数: ${list.length}`);
+    const list = extractCards($).slice(0, 30);
+    await OmniBox.log("info", `[Gimy剧迷][home] 推荐数=${list.length} 简繁=${simplifyConverterName}`);
     return { class: config.class, filters: config.filters, list };
   } catch (e) {
     await OmniBox.log("error", `[Gimy剧迷][home] ${e.message}`);
@@ -450,45 +466,84 @@ async function home(params, context) {
   }
 }
 
+// ==================== 分类列表 ====================
 async function category(params, context) {
   try {
     const page = Math.max(Number(params.page || 1) || 1, 1);
-    const categoryId = String(params.categoryId || params.type_id || "2");
-    const filters = params.filters || {};
-    const by = String(filters.by || "time");
-    const url = `${BASE_URL}/genre/${categoryId}.html${page > 1 || by !== "time" ? `?page=${page}&by=${encodeURIComponent(by)}` : ""}`;
+    let typeId = String(params.categoryId || params.type_id || params.tid || "1").trim();
+    if (typeId && !/^\d+$/.test(typeId)) {
+      const hit = CATEGORIES.find((c) => c.type_name === typeId);
+      if (hit) typeId = hit.type_id;
+      else typeId = "1";
+    }
+
+    let ext = params.filters || params.extend || {};
+    if (typeof ext === "string") {
+      try {
+        ext = JSON.parse(ext);
+      } catch (_) {
+        ext = {};
+      }
+    }
+    const area = String(ext.area || "").trim();
+    const year = String(ext.year || "").trim();
+
+    const url = buildExploreUrl(typeId, area, year) + (page > 1 ? `?page=${page}` : "");
     const html = await requestText(url);
     const $ = cheerio.load(html);
     const list = extractCards($);
-    await OmniBox.log("info", `[Gimy剧迷][category] type=${categoryId} page=${page} list=${list.length}`);
-    return {
-      page,
-      pagecount: page + (list.length >= 20 ? 1 : 0),
-      total: page * 20 + list.length,
-      list,
-    };
+
+    // 有页码链接就以最大页码为准，否则按「满 36 条还有下一页」估算
+    let pagecount = 1;
+    const pageNums = String(html).match(/\/explore\/[^"']*?-(\d+)-\d+\.html|[?&]page=(\d+)/g) || [];
+    const nums = [];
+    for (const raw of pageNums) {
+      const m = String(raw).match(/(\d+)(?:\.html)?$/);
+      if (m) nums.push(Number(m[1]));
+    }
+    if (nums.length) pagecount = Math.max(page, ...nums);
+    else pagecount = list.length >= 36 ? page + 1 : page;
+
+    await OmniBox.log("info", `[Gimy剧迷][category] type=${typeId} area=${area} year=${year} page=${page} list=${list.length} pagecount=${pagecount}`);
+    return { page, pagecount, limit: 36, total: pagecount * 36, list };
   } catch (e) {
     await OmniBox.log("error", `[Gimy剧迷][category] ${e.message}`);
     return { page: 1, pagecount: 0, total: 0, list: [] };
   }
 }
 
-function collectPlaylistEpisodes($, scope) {
-  const episodes = [];
-  const seen = new Set();
-  $(scope).find("a[href*='/play/']").each((_, a) => {
-    const $a = $(a);
-    const href = $a.attr("href") || "";
-    const playId = absUrl(href);
-    if (!playId || seen.has(playId)) return;
-    const epName = toDisplayText($a.text()) || "正片";
-    seen.add(playId);
-    episodes.push({ name: epName, playId });
+// ==================== 详情 ====================
+// 新模板线路结构：
+//   <div class="route-title">4K线路 <span class="hd">HD</span></div>
+//   <div class="eps episodes-route..." data-route-sid="12"><a class="ep" href="/play/{vid}-{sid}-{nid}.html">第1集</a>…</div>
+function parsePlaySourcesNew($) {
+  const sources = [];
+  $("[data-route-sid]").each((_, el) => {
+    const $eps = $(el);
+    const sid = String($eps.attr("data-route-sid") || "");
+    let $title = $eps.prevAll(".route-title").first();
+    if (!$title.length) $title = $eps.parent().find(".route-title").first();
+    const $titleClone = $title.clone();
+    $titleClone.find(".hd, .badge, .label, .tag").remove();
+    const name = toDisplayText($titleClone.text()) || `線路${sid || sources.length + 1}`;
+
+    const episodes = [];
+    const seen = new Set();
+    $eps.find("a.ep, a[href*='/play/']").each((__, a) => {
+      const $a = $(a);
+      const href = $a.attr("href") || "";
+      if (!/\/play\/\d+-\d+-\d+\.html/i.test(href)) return;
+      const playId = absUrl(href);
+      if (seen.has(playId)) return;
+      seen.add(playId);
+      episodes.push({ name: toDisplayText($a.text()) || "正片", playId });
+    });
+    if (episodes.length) sources.push({ name, episodes });
   });
-  return episodes;
+  return sources;
 }
 
-function parsePlaySources($) {
+function parsePlaySourcesOld($) {
   const tabs = [];
   const seenTabs = new Set();
   $("#playTab a[href^='#con_playlist_']").each((_, el) => {
@@ -502,48 +557,113 @@ function parsePlaySources($) {
     }
   });
 
-  const playSources = [];
+  const sources = [];
   for (const tab of tabs) {
     let episodes = [];
     $("[id]").filter((_, el) => String($(el).attr("id") || "") === tab.tabId).each((_, playlist) => {
-      const candidate = collectPlaylistEpisodes($, playlist);
-      if (candidate.length > episodes.length) episodes = candidate;
+      const found = [];
+      const seen = new Set();
+      $(playlist).find("a[href*='/play/']").each((__, a) => {
+        const playId = absUrl($(a).attr("href") || "");
+        if (!playId || seen.has(playId)) return;
+        seen.add(playId);
+        found.push({ name: toDisplayText($(a).text()) || "正片", playId });
+      });
+      if (found.length > episodes.length) episodes = found;
     });
-    if (episodes.length) playSources.push({ name: tab.name, episodes });
+    if (episodes.length) sources.push({ name: tab.name, episodes });
   }
-  return sortPlaySources(playSources);
+  return sources;
 }
 
-function pickInfo(html, label) {
-  const re = new RegExp(`<span[^>]*>${label}[：:]<\\/span>([\\s\\S]*?)<\\/li>`, "i");
-  const m = String(html || "").match(re);
-  if (!m) return "";
-  return toDisplayText(m[1]);
+function parsePlaySources($, html) {
+  let sources = parsePlaySourcesNew($);
+  if (!sources.length) sources = parsePlaySourcesOld($);
+  if (!sources.length) {
+    // 兜底：整页抓 /play/x-y-z.html，按 sid 分组
+    const bySid = new Map();
+    const re = /href=["']\/play\/(\d+)-(\d+)-(\d+)\.html["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    while ((m = re.exec(String(html || ""))) !== null) {
+      const sid = m[2];
+      if (!bySid.has(sid)) bySid.set(sid, []);
+      bySid.get(sid).push({ name: toDisplayText(m[4]) || `第${m[3]}集`, playId: `${BASE_URL}/play/${m[1]}-${m[2]}-${m[3]}.html` });
+    }
+    for (const [sid, eps] of bySid) {
+      const seen = new Set();
+      const uniq = eps.filter((e) => (seen.has(e.playId) ? false : (seen.add(e.playId), true)));
+      sources.push({ name: `線路${sid}`, episodes: uniq });
+    }
+  }
+  return sortPlaySources(sources);
+}
+
+function pickInfo(html, labels) {
+  const list = Array.isArray(labels) ? labels : [labels];
+  for (const label of list) {
+    // 新模板：<span class="k">地區：</span>中國大陸 </div>
+    let m = String(html || "").match(
+      new RegExp(`<span class="k">\\s*${label}\\s*[：:]\\s*</span>\\s*([\\s\\S]*?)</div>`, "i")
+    );
+    if (m) return toDisplayText(m[1]);
+    // 老模板：<li><span>地區：</span>xxx</li>
+    m = String(html || "").match(new RegExp(`<span[^>]*>${label}[：:]</span>([\\s\\S]*?)</li>`, "i"));
+    if (m) return toDisplayText(m[1]);
+  }
+  return "";
 }
 
 async function detail(params, context) {
   try {
     const videoId = String(params.videoId || params.id || params.vod_id || "").trim();
     if (!videoId) return { list: [] };
-    const url = /^https?:\/\//i.test(videoId) ? videoId : absUrl(videoId);
+
+    let url = videoId;
+    let vid = videoId;
+    const idMatch = videoId.match(/\/detail\/(\d+)\.html/) || videoId.match(/^(\d+)$/);
+    if (idMatch) {
+      vid = idMatch[1];
+      url = `${BASE_URL}/detail/${vid}.html`;
+    } else if (!/^https?:\/\//i.test(videoId)) {
+      url = absUrl(videoId);
+    }
+
     const html = await requestText(url);
     const $ = cheerio.load(html);
 
-    const vod_name = toDisplayText($("h1.text-overflow, h1").first().text() || $("title").text().split("線上看")[0]);
-    const vod_pic = absUrl($("meta[property='og:image']").attr("content") || $(".details-pic .video-pic").attr("style")?.match(/url\(([^)]+)\)/)?.[1] || $("img").first().attr("src") || "");
-    const vod_content = toDisplayText($(".switch-box .text, .details-content .text, .details-content, .detail-sketch").first().text() || $("meta[name='description']").attr("content") || "");
-    const vod_remarks = pickInfo(html, "狀態") || pickInfo(html, "状态");
-    const type_name = pickInfo(html, "類別") || pickInfo(html, "类别");
-    const vod_year = pickInfo(html, "年代") || pickInfo(html, "年份");
-    const vod_area = pickInfo(html, "國家/地區") || pickInfo(html, "国家/地区");
-    const vod_actor = toDisplayText($("li:contains('主演') a").map((_, el) => $(el).text()).get().join(" / "));
-    const vod_director = toDisplayText($("li:contains('導演') a, li:contains('导演') a").map((_, el) => $(el).text()).get().join(" / "));
-    const vod_play_sources = parsePlaySources($);
+    let vod_name = toDisplayText(
+      $("meta[property='og:title']").attr("content") || ""
+    ).replace(/\s*線上看\s*[-–]\s*Gimy.*$/i, "").trim();
+    if (!vod_name) vod_name = toDisplayText($("h1").first().text() || $("title").text().split("線上看")[0]);
 
-    await OmniBox.log("info", `[Gimy剧迷][detail] ${url} 线路=${vod_play_sources.length}`);
+    const vod_pic = absUrl(
+      $("meta[property='og:image']").attr("content")
+      || $(".details-pic .video-pic").attr("style")?.match(/url\(([^)]+)\)/)?.[1]
+      || $("img").first().attr("src")
+      || ""
+    );
+    let vod_content = toDisplayText($("meta[property='og:description']").attr("content") || "");
+    if (!vod_content) {
+      vod_content = toDisplayText($(".switch-box .text, .details-content .text, .details-content, .detail-sketch").first().text());
+    }
+
+    const vod_remarks = pickInfo(html, ["狀態", "状态", "更新"]);
+    let type_name = pickInfo(html, ["類別", "类别"]);
+    // 站方格式「陸劇 · 2019」，只留类型名
+    if (type_name) type_name = type_name.replace(/\s*·\s*\d{4}.*$/, "").trim();
+    const vod_year = pickInfo(html, ["年份", "年代"]);
+    const vod_area = pickInfo(html, ["地區", "地区", "國家/地區", "国家/地区"]);
+    let vod_actor = pickInfo(html, ["演員", "演员", "主演"]);
+    let vod_director = pickInfo(html, ["導演", "导演"]);
+    if (!vod_actor) vod_actor = toDisplayText($("li:contains('主演') a").map((_, el) => $(el).text()).get().join(" / "));
+    if (!vod_director) vod_director = toDisplayText($("li:contains('導演') a, li:contains('导演') a").map((_, el) => $(el).text()).get().join(" / "));
+
+    const vod_play_sources = parsePlaySources($, html);
+
+    await OmniBox.log("info", `[Gimy剧迷][detail] ${url} 线路=${vod_play_sources.length} 集数=${vod_play_sources.map((s) => `${s.name}:${s.episodes.length}`).join(",")}`);
     return {
       list: [{
-        vod_id: url,
+        vod_id: vid,
         vod_name,
         vod_pic,
         vod_content,
@@ -562,37 +682,71 @@ async function detail(params, context) {
   }
 }
 
-async function search(params, context) {
-  try {
-    const keyword = String(params.keyword || params.key || params.wd || "").trim();
-    const page = Math.max(Number(params.page || 1) || 1, 1);
-    if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
-
-    const url = `${BASE_URL}/find/-------------.html?wd=${encodeURIComponent(keyword)}&page=${page}`;
-    const html = await requestText(url);
-    const $ = cheerio.load(html);
-    const scope = $(".box-main-content").first();
-    const list = extractCards($, scope);
-    await OmniBox.log("info", `[Gimy剧迷][search] keyword=${keyword} page=${page} scope=.box-main-content list=${list.length}`);
-    return {
-      page,
-      pagecount: page + (list.length >= 20 ? 1 : 0),
-      total: list.length,
-      list,
-    };
-  } catch (e) {
-    await OmniBox.log("error", `[Gimy剧迷][search] ${e.message}`);
-    return { page: 1, pagecount: 0, total: 0, list: [] };
-  }
+// ==================== 搜索 ====================
+// 站点新版：/find/ 已被 CF 重点照顾，走 MacCMS 自带的 ajax/suggest（返回 JSON）
+async function searchBySuggest(keyword, page) {
+  const url = `${BASE_URL}/index.php/ajax/suggest?mid=1&wd=${encodeURIComponent(keyword)}&limit=20&page=${page}`;
+  const text = await requestText(url, {
+    accept: "application/json, text/javascript, */*; q=0.01",
+    fetchMode: "cors",
+    fetchDest: "empty",
+    timeout: 15000,
+  });
+  const json = JSON.parse(text);
+  if (!json || Number(json.code) !== 1) return [];
+  return (json.list || []).map((it) => ({
+    vod_id: String(it.id || ""),
+    vod_name: toDisplayText(it.name || ""),
+    vod_pic: absUrl(it.pic || ""),
+    vod_remarks: "",
+  })).filter((it) => it.vod_id);
 }
 
-// ---------- 播放解析 ----------
-// 说明：旧版走的 play.gimyai.tw（/v/、/d/、/n/ 下的 parse.php）已经整域没有 DNS 解析，
-// 这里改成「页内数据 → 页内直链 → 同源解析接口 → iframe 内层 → 嗅探」的阶梯，逐级回退。
+async function searchByFind(keyword, page) {
+  const url = `${BASE_URL}/find/-------------.html?wd=${encodeURIComponent(keyword)}&page=${page}`;
+  const html = await requestText(url);
+  const $ = cheerio.load(html);
+  const scope = $(".box-main-content").first();
+  return extractCards($, scope.length ? scope : null);
+}
+
+async function search(params, context) {
+  const keyword = String(params.keyword || params.key || params.wd || "").trim();
+  const page = Math.max(Number(params.page || 1) || 1, 1);
+  if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
+
+  let list = [];
+  try {
+    list = await searchBySuggest(keyword, page);
+    await OmniBox.log("info", `[Gimy剧迷][search] ajax/suggest keyword=${keyword} page=${page} list=${list.length}`);
+  } catch (e) {
+    await OmniBox.log("warn", `[Gimy剧迷][search] ajax/suggest 失败: ${e.message}`);
+  }
+
+  if (!list.length) {
+    try {
+      list = await searchByFind(keyword, page);
+      await OmniBox.log("info", `[Gimy剧迷][search] find 兜底 keyword=${keyword} page=${page} list=${list.length}`);
+    } catch (e) {
+      await OmniBox.log("error", `[Gimy剧迷][search] ${e.message}`);
+    }
+  }
+
+  return {
+    page,
+    pagecount: list.length >= 20 ? page + 1 : page,
+    limit: 20,
+    total: list.length,
+    list,
+  };
+}
+
+// ==================== 播放解析 ====================
+// 说明：旧版走的 play.gimyai.tw 已整域无 DNS；现在播放地址在播放页的
+// var player_data = {url, from, encrypt} 里，encrypt=1 是 URL 编码、=2 是 base64+URL 编码。
+// 直链（.m3u8/.mp4）直接返回；芒果/腾讯/优酷这类需要解析器的，交给公开解析站。
 const MEDIA_RE = /https?:\/\/[^\s"'<>\\]+?\.(?:m3u8|mp4|flv)(?:\?[^\s"'<>\\]*)?/gi;
 
-// 只认「路径本身」是视频后缀的地址：解析页常见 .../v/?url=https%3A%2F%2Fx.mp4 这种尾巴，
-// 直接当直链会把整个 iframe 页丢给播放器。
 function isDirectMedia(url) {
   const value = String(url || "").trim();
   if (!/^https?:\/\//i.test(value)) return false;
@@ -616,8 +770,9 @@ function pickMediaUrl(text) {
 function parseInlinePlayer(html) {
   const text = String(html || "");
   const patterns = [
-    /var\s+player_data\s*=\s*(\{[\s\S]*?\})\s*(?:;|<\/script>)/i,
-    /var\s+player_aaaa\s*=\s*(\{[\s\S]*?\})\s*(?:;|<\/script>)/i,
+    /var\s+player_data\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/i,
+    /var\s+player_aaaa\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/i,
+    /player_data\s*=\s*(\{[\s\S]*?\})\s*;/i,
   ];
   for (const re of patterns) {
     const m = text.match(re);
@@ -646,45 +801,13 @@ function buildPlayResult(url, from, referer) {
   };
 }
 
-async function tryParseEndpoint(rawUrl, from, referer) {
-  const paths = [];
-  if (from === "NSYS") paths.push("/n/");
-  if (/^JD/.test(from)) paths.push("/d/");
-  paths.push("/v/", "/d/", "/");
-
-  const tried = new Set();
-  for (const p of paths) {
-    if (tried.has(p)) continue;
-    tried.add(p);
-    const parseUrl = `${BASE_URL}${p}parse.php?url=${encodeURIComponent(rawUrl)}`
-      + (from ? `&jctype=${encodeURIComponent(from)}` : "")
-      + (p === "/n/" ? `&next=${encodeURIComponent(referer)}` : "")
-      + `&_t=${Date.now()}`;
-    try {
-      const text = await requestText(parseUrl, {
-        referer: `${BASE_URL}${p}?url=${encodeURIComponent(rawUrl)}`,
-        accept: "application/json, text/plain, */*",
-        fetchMode: "cors",
-        fetchDest: "empty",
-        timeout: 10000,
-      });
-      let json = null;
-      try {
-        json = JSON.parse(text);
-      } catch (_) {}
-      const candidate = String(
-        (json && (json.url || json.video || json.playurl || (json.data && json.data.url))) || ""
-      ).trim() || pickMediaUrl(text);
-      if (/^https?:\/\//i.test(candidate)) {
-        await OmniBox.log("info", `[Gimy剧迷][play] parse 命中 ${p} -> ${candidate.slice(0, 120)}`);
-        return candidate;
-      }
-      await OmniBox.log("warn", `[Gimy剧迷][play] parse ${p} 无地址: ${String(text).slice(0, 100)}`);
-    } catch (e) {
-      await OmniBox.log("warn", `[Gimy剧迷][play] parse ${p} 失败: ${e.message}`);
-    }
-  }
-  return "";
+// 站方对非直链线路（mgtt/qq/优酷/qsvip/JD4K…）用公开解析站，这里保持同样口径
+function buildParserUrl(rawUrl, from) {
+  const flag = String(from || "");
+  let prefix = "lb";
+  if (flag === "qsvip" || flag === "qq" || flag === "mgtv") prefix = "qs";
+  if (/^JD/.test(flag)) prefix = "jd";
+  return `https://v.attzy.com/ap/${prefix}/?url=${encodeURIComponent(rawUrl)}`;
 }
 
 async function resolveIframe(iframeUrl, referer, depth) {
@@ -692,22 +815,50 @@ async function resolveIframe(iframeUrl, referer, depth) {
   try {
     await OmniBox.log("info", `[Gimy剧迷][play] 进 iframe(depth=${depth}) ${iframeUrl.slice(0, 150)}`);
     const html = await requestText(iframeUrl, { referer, timeout: 12000 });
-
     const direct = pickMediaUrl(html);
     if (direct) return direct;
-
     const data = parseInlinePlayer(html);
     if (data && data.url) {
-      const rawUrl = String(data.url).replace(/\\\//g, "/");
+      let rawUrl = String(data.url).replace(/\\\//g, "/");
+      const enc = Number(data.encrypt || 0);
+      if (enc === 1) rawUrl = decodeURIComponent(rawUrl);
+      else if (enc === 2) {
+        try {
+          rawUrl = decodeURIComponent(Buffer.from(rawUrl, "base64").toString("utf8"));
+        } catch (_) {}
+      }
       if (isDirectMedia(rawUrl)) return rawUrl;
-      const parsed = await tryParseEndpoint(rawUrl, String(data.from || ""), iframeUrl);
+      const parsed = await tryParserEndpoint(rawUrl, String(data.from || ""), iframeUrl);
       if (parsed) return parsed;
     }
-
     const nextIframe = extractIframe(html);
     if (nextIframe && nextIframe !== iframeUrl) return resolveIframe(nextIframe, iframeUrl, depth + 1);
   } catch (e) {
     await OmniBox.log("warn", `[Gimy剧迷][play] iframe 解析失败: ${e.message}`);
+  }
+  return "";
+}
+
+async function tryParserEndpoint(rawUrl, from, referer) {
+  const parserUrl = buildParserUrl(rawUrl, from);
+  try {
+    const text = await requestText(parserUrl, {
+      referer: `${BASE_URL}/`,
+      accept: "text/html,application/json,*/*",
+      timeout: 12000,
+    });
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch (_) {}
+    const candidate = String((json && (json.url || json.video || json.playurl)) || "").trim() || pickMediaUrl(text);
+    if (isDirectMedia(candidate)) {
+      await OmniBox.log("info", `[Gimy剧迷][play] 解析站命中 ${parserUrl.slice(0, 80)} -> ${candidate.slice(0, 110)}`);
+      return candidate;
+    }
+    await OmniBox.log("warn", `[Gimy剧迷][play] 解析站无直链 ${parserUrl.slice(0, 80)}`);
+  } catch (e) {
+    await OmniBox.log("warn", `[Gimy剧迷][play] 解析站失败: ${e.message}`);
   }
   return "";
 }
@@ -721,7 +872,13 @@ async function play(params, context) {
       return buildPlayResult(playId, "直链", `${BASE_URL}/`);
     }
 
-    const pageUrl = /^https?:\/\//i.test(playId) ? playId : absUrl(playId);
+    // playId 可能是 /play/{vid}-{sid}-{nid}.html，也可能只有 {vid}-{sid}-{nid}
+    let pageUrl = playId;
+    if (!/^https?:\/\//i.test(playId)) {
+      pageUrl = /^\/?play\//i.test(playId)
+        ? absUrl(playId.startsWith("/") ? playId : `/${playId}`)
+        : `${BASE_URL}/play/${playId.replace(/^.*\//, "")}${/\.html$/i.test(playId) ? "" : ".html"}`;
+    }
     const baseHeaders = { "User-Agent": UA, Referer: pageUrl, Origin: BASE_URL };
     await OmniBox.log("info", `[Gimy剧迷][play] start pageUrl=${pageUrl}`);
 
@@ -733,32 +890,45 @@ async function play(params, context) {
     }
 
     if (html) {
-      // 1) 页内 player 数据（macCMS 的 player_aaaa / 站方 player_data）
       const player = parseInlinePlayer(html);
       if (player && player.url) {
-        const rawUrl = String(player.url).replace(/\\\//g, "/");
+        let rawUrl = String(player.url).replace(/\\\//g, "/");
         const from = String(player.from || "");
-        await OmniBox.log("info", `[Gimy剧迷][play] player 数据 url=${rawUrl.slice(0, 130)} from=${from}`);
+        const enc = Number(player.encrypt === undefined ? player.encrypt || 0 : player.encrypt || 0) || 0;
+        if (enc === 1) {
+          try {
+            rawUrl = decodeURIComponent(rawUrl);
+          } catch (_) {}
+        } else if (enc === 2) {
+          try {
+            rawUrl = decodeURIComponent(Buffer.from(rawUrl, "base64").toString("utf8"));
+          } catch (_) {}
+        }
+        await OmniBox.log("info", `[Gimy剧迷][play] player_data url=${rawUrl.slice(0, 130)} from=${from} encrypt=${enc}`);
+
         if (isDirectMedia(rawUrl)) return buildPlayResult(rawUrl, from || "直链", pageUrl);
 
-        const parsed = await tryParseEndpoint(rawUrl, from, pageUrl);
+        const parsed = await tryParserEndpoint(rawUrl, from, pageUrl);
         if (parsed) return buildPlayResult(parsed, from || "解析线路", pageUrl);
 
-        // 站外的解析页：当成 iframe 再挖一层
-        if (/^https?:\/\//i.test(rawUrl) && !/(^|\.)gimyai\.tw|(^|\.)aigm\.tv|(^|\.)gmtv\.app/i.test(rawUrl)) {
-          const inner = await resolveIframe(rawUrl, pageUrl, 0);
-          if (inner) return buildPlayResult(inner, from || "解析线路", pageUrl);
-        }
+        // 解析站没吐出直链时，把解析页交给客户端（它内置解析器能处理）
+        const parserUrl = buildParserUrl(rawUrl, from);
+        await OmniBox.log("warn", `[Gimy剧迷][play] 回退解析页 ${parserUrl.slice(0, 120)}`);
+        return {
+          parse: 1,
+          url: parserUrl,
+          urls: [{ name: toDisplayText(from) || "解析播放", url: parserUrl }],
+          header: { "User-Agent": UA, Referer: `${BASE_URL}/` },
+          headers: { "User-Agent": UA, Referer: `${BASE_URL}/` },
+        };
       }
 
-      // 2) 页内直接写死的 m3u8/mp4
       const inline = pickMediaUrl(html);
       if (inline) {
         await OmniBox.log("info", `[Gimy剧迷][play] 页内直链 ${inline.slice(0, 130)}`);
         return buildPlayResult(inline, "页内直链", pageUrl);
       }
 
-      // 3) iframe 内层
       const iframe = extractIframe(html);
       if (iframe) {
         const inner = await resolveIframe(iframe, pageUrl, 0);
@@ -766,7 +936,6 @@ async function play(params, context) {
       }
     }
 
-    // 4) 嗅探兜底
     try {
       const sniffed = await OmniBox.sniffVideo(pageUrl, { "User-Agent": UA, Referer: pageUrl });
       await OmniBox.log("info", `[Gimy剧迷][play] sniff=${JSON.stringify(sniffed || {}).slice(0, 200)}`);
