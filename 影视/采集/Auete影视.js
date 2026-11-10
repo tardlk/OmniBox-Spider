@@ -1,8 +1,8 @@
 // @name Auete影视
 // @author 梦
-// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页；失效图床的封面自动用豆瓣海报补齐（经站点 img.php 代理），AU_DOUBAN_COVER=0 可关；封面默认直连（AU_IMG_PROXY=off|wsrv|server|site）
+// @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页
 // @dependencies cheerio
-// @version 2.3.0
+// @version 2.4.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/Auete影视.js
 
 const OmniBox = require("omnibox_sdk");
@@ -337,7 +337,7 @@ async function searchViaSite(keyword) {
       );
       if (!/系统安全验证|搜索限制/.test(html)) {
         await cachePut(TS_KEY, Date.now(), 600);
-        const list = await fillCovers(parseCards(html));
+        const list = parseCards(html);
         await logInfo(`search 已验证会话直取 keyword=${keyword} list=${list.length}`);
         return list;
       }
@@ -360,7 +360,7 @@ async function searchViaSite(keyword) {
   }
   if (solved.session) await cachePut(SESS_KEY, solved.session, SESS_TTL);
   await cachePut(TS_KEY, Date.now(), 600);
-  const list = await fillCovers(parseCards(String(solved.html || "")));
+  const list = parseCards(String(solved.html || ""));
   await logInfo(`search 验证码已解 ${solved.answer || ""} 耗时=${solved.cost || 0}ms keyword=${keyword} list=${list.length}`);
   return list;
 }
@@ -376,151 +376,6 @@ function absUrl(path = "") {
   if (/^https?:\/\//i.test(value)) return value;
   if (value.startsWith("//")) return `https:${value}`;
   return `${HOST}${value.startsWith("/") ? "" : "/"}${value}`;
-}
-
-// ===== 封面 =====
-// 站点自身的封面来自多个第三方图床，其中：
-// - img3.doubanio.com 直连返回 418（防盗链），站点用 /img.php?url= 包一层，
-//   但这个代理很不稳（同样 URL 多次请求会返回 200 + 0 字节）
-// - pic.rmb.bdstatic.com 在部分网络下完全打不开（站点自己也会 fallback 到 loading.gif）
-// 所以默认把这类封面转给 wsrv.nl 图片代理（它去取原图再回传，绕开防盗链与线路问题）。
-// AU_IMG_PROXY=auto（默认）| wsrv | site | off
-const IMG_PROXY = String(process.env.AU_IMG_PROXY || "off").trim().toLowerCase();
-const IMG_BAIDU = /(bdstatic\.com|(^|\.)baidu\.com)/i;
-// OmniBox 自带服务端图片代理：由 NAS 拉图再回给客户端，客户端网络再差也能显示
-let IMG_BASE = "";
-
-function setImgBase(context) {
-  const base = String((context && context.baseURL) || "").replace(/\/+$/, "");
-  if (base) IMG_BASE = base;
-}
-
-function unwrapImgProxy(url = "") {
-  // 站点自带的 /img.php?url=<原图> 包装
-  const m = String(url).match(/\/img\.php\?url=(.+)$/i);
-  if (!m) return "";
-  let inner = m[1];
-  try {
-    inner = decodeURIComponent(inner);
-  } catch (_) {
-    /* 没编码就直接用 */
-  }
-  if (!/^https?:\/\//i.test(inner)) inner = `https://${inner}`;
-  return inner;
-}
-
-function toWsrv(url) {
-  // output=jpg 是为了兼容不认 webp 的播放端，w=320 顺带把体积压下来
-  return `https://wsrv.nl/?url=${encodeURIComponent(url)}&w=320&output=jpg&q=80`;
-}
-
-// 服务端代理：/api/proxy/image?url=<原图>，由 OmniBox 自己把图拉回来
-function serverProxy(url) {
-  if (!IMG_BASE) return "";
-  return `${IMG_BASE}/api/proxy/image?url=${encodeURIComponent(url)}`;
-}
-
-// 站点自己的脏数据：模板未渲染的 ${r.cover}、懒加载占位、以及已经 502 的图床
-const IMG_JUNK = /(\$\{|\{r\.cover\}|loading\.gif|statics\/picture\/logo)/i;
-const IMG_DEAD_HOST = /(vod\.dyttimage\.com|vvmp4\.com)/i; // dyttimage 整站 502；vvmp4 大量超时/404，干脆交给豆瓣补
-
-// ===== 封面补全（豆瓣） =====
-// 站点有不少老片封面挂在已 502 的图床上（vod.dyttimage.com 等），原站自己也是裂图。
-// 这类没有可救的原始地址，改用豆瓣的条目海报：豆瓣搜索接口返回 img（doubanio 直连 418），
-// 所以再套一层站点自带的 img.php 代理（实测 jpg 海报稳定 27KB，webp 会被代理截断成 168B，
-// 需要把 .webp 换成 .jpg 并固定到 img1 分片）。
-const DOUBAN_COVER = String(process.env.AU_DOUBAN_COVER || "1") !== "0";
-const DOUBAN_MAX = Math.max(0, Number(process.env.AU_DOUBAN_MAX || 6));
-const DOUBAN_TTL = 7 * 24 * 3600;
-
-function doubanQueryName(name) {
-  return String(name || "")
-    .replace(/[（(][^）)]*[）)]/g, " ")
-    .replace(/\s*\/\s*.*$/, " ") // 站点标题常写成「中文名 / English」
-    .replace(/第[0-9０-９一二三四五六七八九十百]+[季部集期]/g, " ")
-    .replace(/[·・:：].*$/, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// 豆瓣 suggest 是匿名接口，短时间十几连击会返回空数组（约 1 分钟恢复）。
-// 命中一次「全部查不到」就进入冷却，避免继续硬打把自己封掉。
-const DOUBAN_COOL_KEY = "auete:db:cool:v1";
-
-async function doubanPoster(name) {
-  if (await cacheGet(DOUBAN_COOL_KEY)) return "";
-  const key = `auete:db:v3:${name}`;
-  const cached = await cacheGet(key);
-  if (cached !== null && cached !== undefined && cached !== "") return String(cached);
-  if (cached === "") return "";
-  const queries = [name, doubanQueryName(name)].filter((v, i, a) => v && a.indexOf(v) === i);
-  for (const q of queries) {
-    try {
-      const res = await OmniBox.request(
-        `https://movie.douban.com/j/subject_suggest?q=${encodeURIComponent(q)}`,
-        { method: "GET", headers: { "User-Agent": UA, Referer: "https://movie.douban.com/" } }
-      );
-      if (Number(res && res.statusCode) !== 200) continue;
-      const arr = JSON.parse(String((res && res.body) || "[]"));
-      if (!Array.isArray(arr) || !arr.length) continue;
-      const hit =
-        arr.find((x) => String(x.title || "") === name) ||
-        arr.find((x) => x.title && (name.includes(String(x.title)) || String(x.title).includes(name))) ||
-        arr[0];
-      const img = String((hit && hit.img) || "");
-      if (!img) continue;
-      // 直连 doubanio 一律 418，必须走站点 img.php；webp 海报代理会截断，换 jpg 分片
-      const fixed = img
-        .replace(/\.webp$/i, ".jpg")
-        .replace(/^https?:\/\/img\d\.doubanio\.com/i, "https://img1.doubanio.com");
-      const url = `${HOST}/img.php?url=${encodeURIComponent(fixed)}`;
-      await cachePut(key, url, DOUBAN_TTL);
-      return url;
-    } catch (_) {
-      /* 换下一个查询词 */
-    }
-  }
-  await cachePut(key, "", 86400); // 负缓存，别每次都去问豆瓣
-  return "";
-}
-
-// 只给「取不到封面」的条目补，且每次最多补 DOUBAN_MAX 个，避免拖慢列表
-async function fillCovers(list) {
-  if (!DOUBAN_COVER || !DOUBAN_MAX) return list;
-  const targets = list.filter((it) => it && !it.vod_pic).slice(0, DOUBAN_MAX);
-  if (!targets.length) return list;
-  await Promise.all(
-    targets.map(async (it, idx) => {
-      await sleep(idx * 150); // 稍微错开，别一瞬间打一堆
-      const pic = await doubanPoster(it.vod_name);
-      if (pic) it.vod_pic = pic;
-    })
-  );
-  const filled = targets.filter((it) => it.vod_pic).length;
-  if (filled) await logInfo(`封面补全 ${filled}/${targets.length}（豆瓣）`);
-  // 一批里一个都没查到（≥3 个时）基本是接口限流，先冷静 90 秒
-  if (!filled && targets.length >= 3) {
-    await cachePut(DOUBAN_COOL_KEY, "1", 90);
-    await logInfo("封面补全：豆瓣疑似限流，暂停 90 秒");
-  }
-  return list;
-}
-
-function finalizeImage(raw) {
-  const abs = absUrl(raw);
-  if (!abs) return "";
-  if (IMG_JUNK.test(abs) || IMG_DEAD_HOST.test(abs)) return ""; // 宁可留空让客户端显示默认图
-  if (IMG_PROXY === "off") return abs;
-  const inner = unwrapImgProxy(abs);
-  const target = inner || abs;
-  if (IMG_PROXY === "site") return `${HOST}/img.php?url=${encodeURIComponent(target)}`;
-  if (IMG_PROXY === "wsrv") return toWsrv(target);
-  if (IMG_PROXY === "server") return serverProxy(target) || toWsrv(target);
-  // auto：站点自己包过的（基本都是豆瓣图，直连 418、站点 img.php 稳定）原样保留；
-  // 百度图床（pic.rmb.bdstatic.com 等）客户端常打不开，交给服务端代理拉图
-  if (inner) return abs;
-  if (IMG_BAIDU.test(target)) return serverProxy(target) || toWsrv(target);
-  return target;
 }
 
 function cleanText(text = "") {
@@ -603,7 +458,7 @@ function parseCards(html) {
     );
     if (!name) return;
     seen.add(vodId);
-    const pic = finalizeImage($el.find("a.pic img, img").first().attr("src") || "");
+    const pic = absUrl($el.find("a.pic img, img").first().attr("src") || "");
     const remarks = decodeHtml($el.find(".hdtag").first().text());
     const score = cleanText($el.find(".rating").first().text()).replace(/分$/, "");
     const typeId = getTypeId(href);
@@ -631,10 +486,9 @@ function buildCategoryUrl(typeId, page) {
 }
 
 async function home(params, context) {
-  setImgBase(context);
   try {
     const html = await requestHtml("/index.html");
-    const list = await fillCovers(parseCards(html).slice(0, 40));
+    const list = parseCards(html).slice(0, 40);
     await logInfo(`home list=${list.length}`);
     return { class: CLASS_LIST.map((c) => ({ type_id: c.type_id, type_name: c.type_name })), list };
   } catch (error) {
@@ -644,13 +498,12 @@ async function home(params, context) {
 }
 
 async function category(params, context) {
-  setImgBase(context);
   const page = Math.max(1, Number(params?.page || params?.pg || 1) || 1);
   const typeId = String(params?.type_id || params?.tid || params?.categoryId || "Movie");
   try {
     const url = buildCategoryUrl(typeId, page);
     const html = await requestHtml(url, absUrl(buildCategoryUrl(typeId, 1)));
-    const list = await fillCovers(parseCards(html));
+    const list = parseCards(html);
     const pagecount = parsePageCount(html);
     await logInfo(`category ${typeId} page=${page}/${pagecount} list=${list.length}`);
     return { page, pagecount, total: pagecount * PAGE_SIZE_HINT, list };
@@ -664,7 +517,7 @@ async function category(params, context) {
 function parseDetail(html, pageUrl) {
   const $ = cheerio.load(html || "", { decodeEntities: false });
   const vodName = decodeHtml($("h1").first().text() || $("title").first().text().split("-")[0]).replace(/^《|》$/g, "");
-  const vodPic = finalizeImage($('meta[property="og:image"]').attr("content") || $(".poster img").first().attr("src") || "");
+  const vodPic = absUrl($('meta[property="og:image"]').attr("content") || $(".poster img").first().attr("src") || "");
   const vodContent = decodeHtml($('meta[property="og:description"]').attr("content") || "");
   const text = String(html || "");
   const year = (text.match(/((?:19|20)\d{2})-\d{2}-\d{2}/) || [])[1] || "";
@@ -712,14 +565,12 @@ function parseDetail(html, pageUrl) {
 }
 
 async function detail(params, context) {
-  setImgBase(context);
   const vodId = String(params?.vod_id || params?.videoId || params?.id || "").trim();
   if (!vodId) return { list: [] };
   const pageUrl = absUrl(vodId);
   try {
     const html = await requestHtml(pageUrl);
     const vod = parseDetail(html, pageUrl);
-    if (!vod.vod_pic) await fillCovers([vod]);
     if (!vod.vod_name) {
       await logInfo(`detail ${vodId} 解析为空`);
       return { list: [] };
@@ -810,14 +661,13 @@ async function scanSearch(keyword, context) {
 }
 
 async function search(params, context) {
-  setImgBase(context);
   const page = Math.max(1, Number(params?.page || params?.pg || 1) || 1);
   const keyword = String(params?.wd || params?.keyword || params?.key || "").trim();
   if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
   // 站内搜索本身一页就够（结果通常个位数），翻页直接回空，避免重复请求
   if (page > 1) return { page, pagecount: page, total: 0, list: [] };
 
-  const hitKey = `auete:hit:v2:${keyword.toLowerCase()}`;
+  const hitKey = `auete:hit:v3:${keyword.toLowerCase()}`;
   const hit = await cacheGet(hitKey);
   if (hit) {
     try {
