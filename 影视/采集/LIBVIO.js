@@ -1,27 +1,38 @@
 // @name LIBVIO
 // @author 梦
-// @description 刮削：已接入，弹幕：已接入，播放记录：宿主自动，嗅探：不需要（直链优先，支持网盘线路展开）
+// @description 刮削：已接入，弹幕：已接入，播放记录：宿主自动，嗅探：已接入（直链优先，加密线路回退网页嗅探，支持网盘展开）
 // @dependencies
-// @version 1.5.8
+// @version 1.5.9
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/LIBVIO.js
 
 const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
+const zlib = require("zlib");
+const { AsyncLocalStorage } = require("async_hooks");
+const invocation = new AsyncLocalStorage();
+function isPrefetch() { return invocation.getStore()?.prefetch === true; }
 const { URL } = require("url");
 const OmniBox = require("omnibox_sdk");
 const runner = require("spider_runner");
 
+// 可选：LIBVIO_HOST 指定官网内容域名；默认自动发现。
 const HOST_CANDIDATES = [
     "https://www.libvio.lat",
+    "https://libvio.host",
+    "https://www.libvio.to",
+    "https://libviobd.com",
     "https://www.libvios.com",
     "https://libvio.run",
     "https://www.libvio.mov",
     "https://www.libhd.com",
 ].map((item) => normalizeHost(item)).filter(Boolean);
 const LIBVIO_RELEASE_URL = "https://www.libvio.app";
-const HOST_CACHE_KEY = "libvio:active_host";
-const HOST_CACHE_TTL = 60 * 60 * 24 * 30;
+const HOST_CACHE_KEY = "libvio:active_host:v159";
+const HOST_CACHE_TTL = 60 * 60;
+let hostReady = false;
+let hostResolution = null;
+let probedHome = "";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 let ACTIVE_HOST = HOST_CANDIDATES[0];
 
@@ -99,7 +110,7 @@ function getCurrentHost() {
 
 async function saveActiveHostCache(host) {
     const normalized = normalizeHost(host);
-    if (!normalized) return;
+    if (!normalized || isPrefetch()) return;
     try {
         await OmniBox.setCache(HOST_CACHE_KEY, normalized, HOST_CACHE_TTL);
         logInfo("写入域名缓存", { host: normalized, ttl: HOST_CACHE_TTL });
@@ -112,7 +123,7 @@ async function readActiveHostCache() {
     try {
         const cached = await OmniBox.getCache(HOST_CACHE_KEY);
         const normalized = normalizeHost(cached || "");
-        if (normalized) {
+        if (isSiteHost(normalized)) {
             logInfo("命中域名缓存", { host: normalized });
             return normalized;
         }
@@ -122,32 +133,29 @@ async function readActiveHostCache() {
     return "";
 }
 
-async function fetchReleaseHosts() {
-    const html = await requestTextAbsolute(LIBVIO_RELEASE_URL, {
-        timeout: 12000,
-        hostForHeaders: normalizeHost(LIBVIO_RELEASE_URL),
-    });
-    const found = [];
-    const pushHost = (value) => {
-        const normalized = normalizeHost(value);
-        if (!normalized) return;
-        if (/libvio\.app$/i.test(new URL(normalized).host)) return;
-        found.push(normalized);
-    };
+function isSiteHost(value) {
+    try { return /^https?:$/.test(new URL(value).protocol) && /^(?:www\.)?(?:libvio[a-z0-9-]*\.[a-z]{2,}|libhd\.com)$/i.test(new URL(value).hostname); }
+    catch { return false; }
+}
 
-    const domainRegex = /https?:\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?::\d+)?/g;
-    const hrefRegex = /href=["']([^"']+)["']/g;
-
-    let m;
-    while ((m = domainRegex.exec(html))) pushHost(m[0]);
-    while ((m = hrefRegex.exec(html))) {
-        const href = String(m[1] || "").trim();
-        if (/^https?:\/\//i.test(href)) pushHost(href);
+function extractReleaseHosts(html = "") {
+    const hosts = [];
+    const push = value => { const host = normalizeHost(value); if (isSiteHost(host) && host !== normalizeHost(LIBVIO_RELEASE_URL)) hosts.push(host); };
+    // 只解析公开配置数据，不执行发布页 JavaScript；排除浏览器下载、字体等第三方链接。
+    const key = html.match(/const\s+_K\s*=\s*["']([^"']+)["']/)?.[1];
+    const backups = html.match(/const\s+_BACKUP\s*=\s*\[([\s\S]*?)\];/)?.[1] || "";
+    if (key) for (const match of backups.matchAll(/xorDecode\(\s*["']([\d,]+)["']/g)) {
+        push(match[1].split(",").map((n, i) => String.fromCharCode(Number(n) ^ key.charCodeAt(i % key.length))).join(""));
     }
+    for (const match of html.matchAll(/https?:\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?::\d+)?/g)) push(match[0]);
+    return [...new Set(hosts)];
+}
 
-    const unique = found.filter((item, idx, arr) => arr.indexOf(item) === idx);
-    logInfo("发布页候选域名", { release: LIBVIO_RELEASE_URL, count: unique.length, hosts: unique.slice(0, 12) });
-    return unique;
+async function fetchReleaseHosts() {
+    const html = await requestTextAbsolute(LIBVIO_RELEASE_URL, { timeout: 8000 });
+    const hosts = extractReleaseHosts(html);
+    logInfo("发布页候选域名", { count: hosts.length, hosts });
+    return hosts;
 }
 
 function buildHeadersForHost(host, extra = {}) {
@@ -160,102 +168,113 @@ function buildHeadersForHost(host, extra = {}) {
     };
 }
 
-async function requestTextAbsolute(url, options = {}) {
+async function requestTextAbsolute(url, options = {}, redirects = 0) {
     const target = new URL(url);
+    if (!/^https?:$/.test(target.protocol)) throw new Error("不支持的请求协议");
     const lib = target.protocol === "https:" ? https : http;
-    const hostForHeaders = normalizeHost(options.hostForHeaders || `${target.protocol}//${target.host}`);
-    const headers = buildHeadersForHost(hostForHeaders, options.headers || {});
-
+    const hostForHeaders = normalizeHost(options.hostForHeaders || target.origin);
     return await new Promise((resolve, reject) => {
+        // 总超时覆盖 DNS、TLS 和持续传输，避免域名故障无限等待。
+        const timer = setTimeout(() => req.destroy(new Error(`请求超时: ${target.href}`)), options.timeout || 15000);
+        const finish = (error, body) => { clearTimeout(timer); error ? reject(error) : resolve(body); };
         const req = lib.request(target, {
             method: options.method || "GET",
-            headers,
-            timeout: options.timeout || 15000,
+            headers: buildHeadersForHost(hostForHeaders, options.headers || {}),
         }, (res) => {
+            const status = Number(res.statusCode || 0);
+            if ([301, 302, 303, 307, 308].includes(status) && res.headers.location) {
+                res.resume(); clearTimeout(timer);
+                if (redirects >= 5) return reject(new Error("重定向次数过多"));
+                const next = new URL(res.headers.location, target);
+                if (isSiteHost(target.href) && !isSiteHost(next.href)) return reject(new Error("站点重定向到了非 LIBVIO 域名"));
+                requestTextAbsolute(next.href, { ...options, hostForHeaders: next.origin }, redirects + 1).then(resolve, reject);
+                return;
+            }
             const chunks = [];
-            res.on("data", (chunk) => chunks.push(chunk));
+            let size = 0;
+            res.on("data", chunk => { size += chunk.length; if (size > 8 * 1024 * 1024) req.destroy(new Error("页面过大")); else chunks.push(chunk); });
+            res.on("error", error => finish(error));
             res.on("end", () => {
-                const body = Buffer.concat(chunks).toString("utf8");
-                const statusCode = Number(res.statusCode || 0);
-                if (statusCode < 200 || statusCode >= 400) {
-                    reject(new Error(`请求失败: ${statusCode} ${target.href}`));
-                    return;
-                }
-                resolve(body);
+                if (status < 200 || status >= 300) return finish(new Error(`请求失败: ${status} ${target.href}`));
+                try {
+                    let data = Buffer.concat(chunks);
+                    const encoding = String(res.headers["content-encoding"] || "").toLowerCase();
+                    if (encoding === "gzip") data = zlib.gunzipSync(data);
+                    else if (encoding === "deflate") data = zlib.inflateSync(data);
+                    else if (encoding === "br") data = zlib.brotliDecompressSync(data);
+                    finish(null, data.toString("utf8"));
+                } catch (error) { finish(error); }
             });
         });
-
-        req.on("error", reject);
-        req.on("timeout", () => {
-            req.destroy(new Error(`请求超时: ${target.href}`));
-        });
+        req.on("error", error => finish(error));
         req.end();
     });
 }
 
-async function probeHost(host) {
-    try {
-        await requestTextAbsolute(`${host}/`, { timeout: 8000, hostForHeaders: host });
-        return true;
-    } catch (error) {
-        logInfo("域名探测失败", { host, error: error.message });
-        return false;
-    }
+function isContentHome(html) {
+    return /\/detail\/\d+\.html/.test(html) && /(?:stui-vodlist|LIBVIO)/i.test(html);
 }
 
-async function ensureActiveHost(preferredHost = "") {
-    const preferred = normalizeHost(preferredHost);
-    const cachedHost = await readActiveHostCache();
-
-    let releaseHosts = [];
+async function probeHost(host) {
     try {
-        releaseHosts = await fetchReleaseHosts();
-    } catch (error) {
-        logInfo("读取发布页域名失败", { release: LIBVIO_RELEASE_URL, error: error.message });
-    }
+        const html = await requestTextAbsolute(`${host}/`, { timeout: 15000 });
+        if (!isContentHome(html)) throw new Error("响应不是影视列表页");
+        return html;
+    } catch (error) { logInfo("域名探测失败", { host, error: error.message }); return ""; }
+}
 
-    const ordered = [
-        preferred,
-        cachedHost,
-        getCurrentHost(),
-        ...releaseHosts,
-        ...HOST_CANDIDATES,
-    ].filter(Boolean).filter((item, idx, arr) => arr.indexOf(item) === idx);
-
-    for (const host of ordered) {
-        if (await probeHost(host)) {
-            if (ACTIVE_HOST !== host) {
-                logInfo("切换可用域名", { from: ACTIVE_HOST, to: host });
-            }
-            ACTIVE_HOST = host;
-            await saveActiveHostCache(host);
-            return ACTIVE_HOST;
+async function ensureActiveHost(excludedHost = "") {
+    if (hostReady) return ACTIVE_HOST;
+    if (hostResolution) return await hostResolution;
+    hostResolution = (async () => {
+        const cached = await readActiveHostCache();
+        const custom = normalizeHost(process.env.LIBVIO_HOST || "");
+        // 此版本缓存只由通过内容校验的域名写入；命中后直接使用，实际请求失败再切换。
+        if (cached && cached !== excludedHost && (!custom || custom === cached)) {
+            ACTIVE_HOST = cached; hostReady = true; return ACTIVE_HOST;
         }
-    }
-    throw new Error(`未找到可用域名: ${ordered.join(", ")}`);
+        const tried = new Set();
+        const select = async hosts => {
+            // 小批并发，故障域名不会逐个累积等待；优先保留配置及缓存顺序。
+            const ordered = [...new Set(hosts)].filter(host => isSiteHost(host) && host !== excludedHost && !tried.has(host));
+            for (let i = 0; i < ordered.length; i += 3) {
+                const batch = ordered.slice(i, i + 3); batch.forEach(host => tried.add(host));
+                const results = await Promise.all(batch.map(probeHost));
+                const index = results.findIndex(Boolean);
+                if (index >= 0) {
+                    ACTIVE_HOST = batch[index]; probedHome = results[index]; hostReady = true;
+                    await saveActiveHostCache(ACTIVE_HOST);
+                    logInfo("已验证内容站", { host: ACTIVE_HOST });
+                    return ACTIVE_HOST;
+                }
+            }
+            return "";
+        };
+        if (await select([custom, cached, getCurrentHost()].filter(Boolean))) return ACTIVE_HOST;
+        let released = [];
+        try { released = await fetchReleaseHosts(); } catch (error) { logInfo("读取发布页失败", { error: error.message }); }
+        if (await select([...released, ...HOST_CANDIDATES])) return ACTIVE_HOST;
+        throw new Error("所有 LIBVIO 内容域名暂不可用，请稍后重试或配置 LIBVIO_HOST");
+    })();
+    try { return await hostResolution; } finally { hostResolution = null; }
 }
 
 async function requestText(url, options = {}) {
     const raw = String(url || "").trim();
     if (!raw) throw new Error("请求地址为空");
-
-    if (/^https?:\/\//i.test(raw)) {
-        return await requestTextAbsolute(raw, options);
+    if (/^https?:\/\//i.test(raw) && !isSiteHost(raw)) return await requestTextAbsolute(raw, options);
+    await ensureActiveHost();
+    const path = /^https?:\/\//i.test(raw) ? new URL(raw).pathname + new URL(raw).search : (raw.startsWith("/") ? raw : `/${raw}`);
+    if (path === "/" && probedHome) { const html = probedHome; probedHome = ""; return html; }
+    try { return await requestTextAbsolute(`${ACTIVE_HOST}${path}`, { ...options, hostForHeaders: ACTIVE_HOST }); }
+    catch (error) {
+        // 实际页面请求失败后重新发现站点，兼容域名失效和旧收藏链接。
+        if (options.failover === false) throw error;
+        const failedHost = ACTIVE_HOST;
+        hostReady = false; probedHome = "";
+        await ensureActiveHost(failedHost);
+        return await requestTextAbsolute(`${ACTIVE_HOST}${path}`, { ...options, hostForHeaders: ACTIVE_HOST });
     }
-
-    const hosts = [getCurrentHost(), ...HOST_CANDIDATES].filter(Boolean).filter((item, idx, arr) => arr.indexOf(item) === idx);
-    let lastError = null;
-    for (const host of hosts) {
-        try {
-            await ensureActiveHost(host);
-            const absoluteUrl = raw.startsWith("/") ? `${ACTIVE_HOST}${raw}` : `${ACTIVE_HOST}/${raw}`;
-            return await requestTextAbsolute(absoluteUrl, { ...options, hostForHeaders: ACTIVE_HOST });
-        } catch (error) {
-            lastError = error;
-            logInfo("候选域名请求失败", { host, url: raw, error: error.message });
-        }
-    }
-    throw lastError || new Error(`请求失败: ${raw}`);
 }
 
 function md5Short(input = "") {
@@ -269,7 +288,7 @@ function buildCacheKey(prefix = "", ...parts) {
         .filter((item) => item !== "");
     const raw = rawParts.join("|");
     const short = raw ? md5Short(raw) : "empty";
-    return `${prefix}:${short}`;
+    return `${prefix}:v159:${short}`;
 }
 
 async function getCachedText(cacheKey, ttl, producer) {
@@ -281,7 +300,7 @@ async function getCachedText(cacheKey, ttl, producer) {
     }
     const text = String(await producer());
     try {
-        await OmniBox.setCache(cacheKey, text, ttl);
+        if (!isPrefetch()) await OmniBox.setCache(cacheKey, text, ttl);
     } catch (error) {
         logInfo("写入文本缓存失败", { cacheKey, error: error.message });
     }
@@ -297,14 +316,15 @@ async function getCachedJson(cacheKey, ttl, producer) {
     }
     const value = await producer();
     try {
-        await OmniBox.setCache(cacheKey, JSON.stringify(value), ttl);
+        if (!isPrefetch()) await OmniBox.setCache(cacheKey, JSON.stringify(value), ttl);
     } catch (error) {
         logInfo("写入 JSON 缓存失败", { cacheKey, error: error.message });
     }
     return value;
 }
 
-module.exports = { home, category, detail, search, play };
+module.exports = Object.fromEntries(Object.entries({ home, category, detail, search, play }).map(([name, fn]) =>
+    [name, (params, context = {}) => invocation.run(context, () => fn(params, context))]));
 runner.run(module.exports);
 
 function logInfo(message, data = null) {
@@ -414,7 +434,11 @@ function sortEpisodesByMeta(episodes = []) {
 
 function fixUrl(url = "") {
     if (!url) return "";
-    if (/^https?:\/\//i.test(url)) return url;
+    url = String(url).replace(/&amp;/g, "&");
+    if (/^https?:\/\//i.test(url)) {
+        if (isSiteHost(url)) { const old = new URL(url); return `${getCurrentHost()}${old.pathname}${old.search}${old.hash}`; }
+        return url;
+    }
     if (url.startsWith("//")) return `https:${url}`;
     const host = getCurrentHost();
     return url.startsWith("/") ? `${host}${url}` : `${host}/${url}`;
@@ -714,9 +738,9 @@ async function resolveCategoryUrl(categoryId, page, filters = {}) {
     });
 }
 
-function buildSearchPath(keyword, page = 1) {
-    const pageSeg = page > 1 ? String(page) : "";
-    return `/search/------------${pageSeg}---.html?wd=${encodeURIComponent(keyword)}`;
+function buildSearchPath(keyword) {
+    // 与官网搜索表单 action 对齐；分页跟随页面实际链接。
+    return `/search/-------------.html?wd=${encodeURIComponent(keyword)}`;
 }
 
 async function fetchHtml(url, options = {}) {
@@ -804,9 +828,10 @@ function splitNetdiskPanels(html = "") {
 
     // LIBVIO 详情页常见结构：<div class="stui-vodlist__head"><h3>UC网盘</h3></div><ul>...</ul>
     // 标题与 ul 之间有 </div>，不能只匹配 h3 后紧跟 ul。
-    const regex = /<div class="stui-vodlist__head"[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?(?:网盘|视频下载)[\s\S]*?)<\/h3>[\s\S]*?<\/div>\s*<ul[^>]*>([\s\S]*?)<\/ul>/gi;
+    const regex = /<div class="stui-vodlist__head"[^>]*>[\s\S]*?<h3[^>]*>((?:(?!<\/h3>)[\s\S])*?)<\/h3>[\s\S]*?<\/div>\s*<ul[^>]*>([\s\S]*?)<\/ul>/gi;
     let match;
     while ((match = regex.exec(text))) {
+        if (!/(网盘|下载)/u.test(stripTags(match[1]))) continue;
         panels.push(`<h3>${match[1] || "网盘"}</h3><ul>${match[2] || ""}</ul>`);
     }
 
@@ -1191,201 +1216,54 @@ async function detail(params, context) {
 
         const allCollectSources = extractPlaylistSources(html, videoId, name);
 
-        const netdiskPanels = splitNetdiskPanels(html);
-        const netdiskSources = [];
+        // 普通采集与网盘入口分开：每个分享入口最多请求一次，失败不影响其它线路。
+        const collectSources = allCollectSources.filter(source => !/(网盘|下载)/u.test(source.name));
+        const panelSources = splitNetdiskPanels(html).map(panel => ({
+            name: stripTags(panel.match(/<h3[^>]*>([\s\S]*?)<\/h3>/)?.[1] || "网盘"),
+            episodes: [...panel.matchAll(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)].map(item => ({ name: stripTags(item[2]), playId: fixUrl(item[1]) }))
+        }));
+        const panInputs = [...panelSources, ...allCollectSources.filter(source => /(网盘|下载)/u.test(source.name))];
         const processedHrefs = new Set();
-        for (const panelHtml of netdiskPanels) {
-            const rawSourceTitle = stripTags(panelHtml.match(/<h3[^>]*>([\s\S]*?)<\/h3>/)?.[1] || "网盘");
-            if (!/(网盘|下载)/u.test(rawSourceTitle)) {
-                logInfo("detail 跳过非网盘/下载线路", { sourceName: rawSourceTitle });
-                continue;
-            }
-            const sourceName = normalizePanSourceName(rawSourceTitle);
-            // 记录正在处理的网盘/下载线路（包括 UC）
-            logInfo("detail 开始处理网盘线路", { sourceName, rawTitle: rawSourceTitle });
-            const playLinks = [...panelHtml.matchAll(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)];
-            const episodes = [];
-            for (const item of playLinks) {
-                const href = fixUrl(item[1] || "");
-                if (!/\/play\/[^\/]+\.html/i.test(href)) continue;
-                if (processedHrefs.has(href)) continue;
-                const label = stripTags(item[2] || "").trim() || "合集";
-                const linkTextForPan = `${rawSourceTitle} ${label}`;
-                if (!/(网盘|下载)/u.test(linkTextForPan)) continue;
-                processedHrefs.add(href);
-                const playPageHtml = await fetchHtml(href, { ttl: DETAIL_CACHE_TTL });
-                const playerJson = playPageHtml.match(/player_aaaa\s*=\s*(\{[\s\S]*?\})<\/script>/)?.[1];
-                let episodeList = [];
-                // 如果没有 playerJson 且是 UC 网盘，尝试直接用 href 作为分享链接解析
-                if (!playerJson && /UC/i.test(sourceName)) {
-                    // UC 的播放页本身不是网盘链接，尝试在页面源码里寻找真实的 UC 分享链接
-                    const possibleUrls = [];
-                    const ucUrlMatch = playPageHtml.match(/https?:\/\/[^\s'"<>]*drive\.uc\.cn[^\s'"<>]*/i);
-                    if (ucUrlMatch) possibleUrls.push(ucUrlMatch[0]);
-                    const ucAltMatch = playPageHtml.match(/https?:\/\/[^\s'"<>]*uc\.cn\/s\/[^\s'"<>]*/i);
-                    if (ucAltMatch) possibleUrls.push(ucAltMatch[0]);
-                    let found = false;
-                    for (const shareUrl of possibleUrls) {
-                        if (isPanUrl(shareUrl)) {
-                            const panInfo = await loadPanFiles(shareUrl);
-                            episodeList = Array.isArray(panInfo?.videos) ? panInfo.videos : [];
-                            if (episodeList.length) {
-                                logInfo("detail UC 网盘通过页面提取解析成功", { sourceName, href, shareUrl, episodeCount: episodeList.length });
-                                found = true;
-                                break;
-                            } else {
-                                logInfo("detail UC 网盘通过页面提取无文件", { sourceName, href, shareUrl });
-                            }
-                        }
-                    }
-                    if (!found) {
-                        logInfo("detail UC 网盘未能提取有效分享链接", { sourceName, href });
-                    }
-                }
-                if (playerJson) {
-                    try {
-                        const player = JSON.parse(playerJson);
-                        const rawFrom = String(player.from || "").toLowerCase();
-                        const isPan = rawFrom.includes("uc") || rawFrom.includes("pan") || rawFrom.includes("baidu") || rawFrom.includes("quark") || rawFrom.includes("ali");
-                        if (isPan && player.url) {
-                            const shareUrl = normalizeShareUrl(decodePlayerUrl(player.url, player.encrypt));
-                            if (isPanUrl(shareUrl)) {
-                                const panInfo = await loadPanFiles(shareUrl);
-                                episodeList = Array.isArray(panInfo?.videos) ? panInfo.videos : [];
-                            }
-                        }
-                    } catch (error) {
-                        logInfo("detail 网盘播放页解析失败", { href, error: error.message });
-                    }
-                }
-
-                if (episodeList.length > 0) {
-                    for (const file of episodeList) {
-                        const fileId = getFileId(file);
-                        if (!fileId) continue;
-                        const rawFileName = getFileName(file) || label || "网盘资源";
-                        const episodeName = /第\d+集/.test(rawFileName) ? rawFileName : (rawFileName !== "合集" ? rawFileName : (remarks.match(/第\d+集/)?.[0] || rawFileName));
-                        episodes.push({
-                            name: episodeName,
-                            playId: buildPanEpisodePlayId(normalizeShareUrl(decodePlayerUrl(playerJson ? JSON.parse(playerJson).url : "", playerJson ? JSON.parse(playerJson).encrypt : 0)), fileId, {
-                                mode: "pan-file",
-                                shareUrl: normalizeShareUrl(decodePlayerUrl(playerJson ? JSON.parse(playerJson).url : "", playerJson ? JSON.parse(playerJson).encrypt : 0)),
-                                fileId,
-                                flag: sourceName,
-                                name: episodeName,
-                                vodName: name,
-                                vodId: String(videoId || "")
-                            })
-                        });
-                    }
-                } else {
-                    // 没有展开到具体文件时，不要把“合集”当做一集；直接跳过这个网盘源
-                    logInfo("detail 网盘线路无具体集数，跳过合集占位", { sourceName, href, label });
-                }
-            }
-            if (episodes.length) {
-                logInfo("detail 网盘线路解析完成", { sourceName, episodeCount: episodes.length });
-                netdiskSources.push({ name: sourceName, episodes });
-            } else {
-                logInfo("detail 网盘线路解析失败，已排除", { sourceName, playLinkCount: playLinks.length });
-            }
+        const jobs = [];
+        for (const source of panInputs) for (const ep of source.episodes || []) {
+            const href = fixUrl(String(ep.playId || "").split("|||")[0]);
+            if (!isCollectPlayHref(href) || processedHrefs.has(href)) continue;
+            processedHrefs.add(href);
+            jobs.push({ sourceName: normalizePanSourceName(source.name), href });
         }
-
-        // 过滤掉已经展开的网盘线路以及 UC 网盘（目前不解析）
-        const parsedNetdiskSourceNames = new Set(netdiskSources.map((source) => source.name));
-        // 处理 UC 网盘可能被误放入 collectSources 的情况
-        const ucCollectSources = allCollectSources.filter((src) => normalizePanSourceName(src?.name || "") === "UC网盘");
-        for (const src of ucCollectSources) {
-            const rawSourceTitle = src.name || "UC网盘";
-            const sourceName = normalizePanSourceName(rawSourceTitle);
-            logInfo("detail 开始处理 UC 网盘采集线路", { sourceName, rawSourceTitle });
-            const episodes = [];
-            for (const ep of src.episodes || []) {
-                // ep.playId 在 collectSources 里是普通集合链接 (play page)
-                const href = fixUrl((ep.playId || "").split("|||")[0] || "");
-                if (!href) continue;
-                const playPageHtml = await fetchHtml(href, { ttl: DETAIL_CACHE_TTL });
-                // 首先尝试直接从 player_aaaa 中取分享链接（UC 典型）
-                let resolvedShareUrl = "";
+        const netdiskSources = [];
+        // 预取只读取普通线路，避免触发网盘授权、文件展开和刮削副作用。
+        if (!context?.prefetch) for (let offset = 0; offset < jobs.length; offset += 3) {
+            const results = await Promise.all(jobs.slice(offset, offset + 3).map(async ({ sourceName, href }) => {
+                logInfo("detail 开始处理网盘线路", { sourceName, href });
                 try {
-                    const playerJsonMatch = playPageHtml.match(/player_aaaa\s*=\s*(\{[\s\S]*?\})<\/script>/);
-                    if (playerJsonMatch) {
-                        const player = JSON.parse(playerJsonMatch[1]);
-                        if (player && typeof player.url === "string" && isPanUrl(player.url)) {
-                            resolvedShareUrl = player.url;
-                        }
+                    const page = await fetchHtml(href, { ttl: DETAIL_CACHE_TTL, timeout: 6000, failover: false });
+                    const json = page.match(/player_aaaa\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/)?.[1];
+                    let shareUrl = "";
+                    if (json) {
+                        const player = JSON.parse(json);
+                        const decoded = normalizeShareUrl(decodePlayerUrl(player.url, player.encrypt));
+                        if (isPanUrl(decoded)) shareUrl = decoded;
                     }
-                } catch (e) {
-                    logInfo("detail UC 解析 player_aaaa 失败", { sourceName, href, error: e.message });
-                }
-                // 若未从 player_aaaa 取到，再尝试正则匹配普通 UC 分享链接
-                const possibleUrls = [];
-                if (resolvedShareUrl) {
-                    possibleUrls.push(resolvedShareUrl);
-                } else {
-                    const ucUrlMatch = playPageHtml.match(/https?:\/\/[^\s'"<>]*drive\.uc\.cn[^\s'"<>]*/i);
-                    if (ucUrlMatch) possibleUrls.push(ucUrlMatch[0]);
-                    const ucAltMatch = playPageHtml.match(/https?:\/\/[^\s'"<>]*uc\.cn\/s\/[^\s'"<>]*/i);
-                    if (ucAltMatch) possibleUrls.push(ucAltMatch[0]);
-                }
-                let found = false;
-                for (const shareUrl of possibleUrls) {
-                    if (!isPanUrl(shareUrl)) continue;
+                    if (!shareUrl) shareUrl = page.replace(/\\\//g, "/").match(/https?:\/\/(?:drive\.uc\.cn|pan\.quark\.cn|pan\.baidu\.com|www\.alipan\.com|www\.aliyundrive\.com)\/s\/[^\s"'<>]+/i)?.[0] || "";
+                    if (!shareUrl) { logInfo("detail 网盘未取得分享链接，排除占位", { sourceName, href }); return null; }
                     const panInfo = await loadPanFiles(shareUrl);
-                    const videoList = panInfo?.videos || [];
-                    if (videoList.length) {
-                        for (const file of videoList) {
-                            const fileId = getFileId(file);
-                            const rawFileName = getFileName(file);
-                            const episodeName = /第\d+集/.test(rawFileName) ? rawFileName : (rawFileName || ep.name);
-                            episodes.push({
-                                name: episodeName,
-                                playId: buildPanEpisodePlayId(normalizeShareUrl(shareUrl), fileId, {
-                                    mode: "pan-file",
-                                    shareUrl: normalizeShareUrl(shareUrl),
-                                    fileId,
-                                    flag: sourceName,
-                                    name: episodeName,
-                                    vodName: name,
-                                    vodId: videoId
-                                })
-                            });
-                        }
-                        logInfo("detail UC 网盘通过采集线路解析成功", { sourceName, href, shareUrl, episodeCount: videoList.length });
-                        found = true;
-                        break;
-                    } else {
-                        logInfo("detail UC 网盘通过采集线路解析无文件", { sourceName, href, shareUrl });
-                    }
+                    const videos = Array.isArray(panInfo?.videos) ? panInfo.videos : [];
+                    const episodes = videos.filter(file => getFileId(file) && getFileName(file)).map(file => {
+                        const fileId = getFileId(file), fileName = getFileName(file);
+                        return { name: fileName, playId: buildPanEpisodePlayId(shareUrl, fileId, {
+                            mode: "pan-file", shareUrl, fileId, flag: sourceName, name: fileName, vodName: name, vodId: videoId,
+                        }) };
+                    });
+                    logInfo("detail 网盘展开结果", { sourceName, href, videoCount: episodes.length });
+                    return episodes.length ? { name: sourceName, episodes } : null;
+                } catch (error) {
+                    logInfo("detail 网盘解析失败，已排除", { sourceName, href, error: error.message });
+                    return null;
                 }
-                if (!found) {
-                    logInfo("detail UC 网盘未能提取有效分享链接", { sourceName, href });
-                }
-            }
-            if (episodes.length) {
-                netdiskSources.push({ name: sourceName, episodes });
-            } else {
-                logInfo("detail UC 网盘解析失败，已排除", { sourceName });
-            }
+            }));
+            netdiskSources.push(...results.filter(Boolean));
         }
-        const collectSources = allCollectSources.filter((source) => {
-            const normName = normalizePanSourceName(source?.name || "");
-            // 已经在 netdiskSources 中的（已展开）
-            if (parsedNetdiskSourceNames.has(normName)) return false;
-            // 已经在 UC 处理后加入 netdiskSources 的也排除
-            if (netdiskSources.some((s) => normalizePanSourceName(s.name) === normName)) return false;
-            return true;
-        });
-        if (allCollectSources.length !== collectSources.length) {
-            logInfo("detail 移除未展开或不支持的网盘线路", {
-                videoId,
-                removed: allCollectSources.length - collectSources.length,
-                parsedNetdiskSources: Array.from(parsedNetdiskSourceNames).join(" | ")
-            });
-        }
-        const sortedNetdiskSources = sortPlaySourcesByDriveOrder(netdiskSources);
-        const expandedNetdiskSources = expandPanSourcesWithRoutes(sortedNetdiskSources, context?.from || "web");
-
 
         // --------- Unified scraping logic (replace previous per-source buckets) ---------
         // 1️⃣ 把所有已经展开的网盘线路（netdiskSources）和普通采集线路（collectSources）统一放进 allSources
@@ -1448,7 +1326,7 @@ async function detail(params, context) {
         // --------- 一次统一刮削 ---------
         let scrapeData = null;
         let videoMappings = [];
-        if (scrapeCandidates.length) {
+        if (scrapeCandidates.length && !context?.prefetch) {
             const keyword = normalizeText(name || "");
             try {
                 await OmniBox.processScraping(videoId, keyword, keyword, scrapeCandidates);
@@ -1640,11 +1518,13 @@ async function search(params, context) {
     const page = Number(params?.page || 1);
     if (!keyword) return emptyPage(page);
     try {
-        const path = buildSearchPath(keyword, page);
+        const basePath = buildSearchPath(keyword);
+        const path = page > 1 ? await resolveCategoryPageUrl(basePath, page) : basePath;
+        if (!path) return emptyPage(page);
         logInfo("search 请求", { keyword, page, host: getCurrentHost(), path, quick: params?.quick ? 1 : 0, from: context?.from || "web" });
         const html = await fetchHtml(path, { ttl: SEARCH_CACHE_TTL });
         const list = parseVodList(html);
-        const pagecount = list.length === DEFAULT_PAGE_SIZE ? page + 1 : page;
+        const pagecount = findCategoryPageHref(html, page + 1) ? page + 1 : page;
         logInfo("search 完成", { keyword, page, listCount: list.length, pagecount });
         return {
             page,
@@ -1665,7 +1545,7 @@ async function play(params, context) {
     if (!playId) return emptyPlay(flag);
     try {
         const { main: rawPlayId, meta } = decodeCombinedPlayId(playId);
-        const playPageUrl = resolveCollectPlayPageUrl(rawPlayId, meta);
+        let playPageUrl = resolveCollectPlayPageUrl(rawPlayId, meta);
         const playFlag = String(meta.flag || flag || "LIBVIO");
         if (!playPageUrl) {
             logInfo("play 无法解析播放页地址", { rawPlayId, flag: playFlag, meta });
@@ -1741,6 +1621,8 @@ async function play(params, context) {
             }
         }
 
+        await ensureActiveHost();
+        playPageUrl = fixUrl(playPageUrl);
         const sniffHeaders = {
             Referer: `${getCurrentHost()}/`,
             Origin: getCurrentHost(),
@@ -1751,7 +1633,7 @@ async function play(params, context) {
             return await getCachedJson(cacheKey, PLAY_CACHE_TTL, async () => {
                 logInfo("play 请求", { playPageUrl, flag: playFlag, from: context?.from || "web" });
                 const html = await fetchHtml(playPageUrl, { ttl: PLAY_CACHE_TTL });
-                const playerJson = html.match(/player_aaaa\s*=\s*(\{[\s\S]*?\})<\/script>/)?.[1];
+                const playerJson = html.match(/player_aaaa\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/)?.[1];
                 if (!playerJson) {
                     logInfo("play 未找到 player_aaaa", { playPageUrl });
                     return {
@@ -1763,7 +1645,7 @@ async function play(params, context) {
                 }
 
                 const player = JSON.parse(playerJson);
-                const realUrl = buildPlayUrl(decodePlayerUrl(player.url, player.encrypt));
+                const realUrl = Number(player.encrypt) > 2 ? "" : buildPlayUrl(decodePlayerUrl(player.url, player.encrypt));
                 if (realUrl && isDirectMediaUrl(realUrl)) {
                     logInfo("play 直链完成", { playPageUrl, from: player.from, finalUrl: realUrl });
                     return {
