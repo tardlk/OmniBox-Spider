@@ -1,8 +1,8 @@
 // @name 蜗牛4K
 // @author @Tao_XG
-// @description 刮削：支持，弹幕：支持，嗅探：支持。站点：zmi.kdns.fr（MacCMS mxone 模板，主推 115 分享）
+// @description 站点：www.wn4k.com；仅保留百度、115、光鸭、阿里分享；保留原有登录、网盘分组与播放能力
 // @dependencies: axios, cheerio
-// @version 1.0.4
+// @version 1.1.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/网盘/蜗牛4K.js
 
 // 引入 OmniBox SDK
@@ -33,16 +33,17 @@ function splitConfigList(value) {
 }
 
 // 网站地址(可以通过环境变量配置,支持多个域名用逗号/分号分割)
-const WEB_SITE_CONFIG = process.env.WEB_SITE_WONIU4K || "https://zmi.kdns.fr";
+const WEB_SITE_CONFIG = process.env.WEB_SITE_WONIU4K || "https://www.wn4k.com";
 const WEB_SITES = splitConfigList(WEB_SITE_CONFIG);
 // 读取环境变量:支持多个网盘类型,用逗号/分号分割（蜗牛主推 115）
-const DRIVE_TYPE_CONFIG = splitConfigList(process.env.DRIVE_TYPE_CONFIG || "115;quark;uc");
+const ALLOWED_DRIVE_TYPES = new Set(["baidu", "115", "guangya", "aliyun"]);
+const DRIVE_TYPE_CONFIG = splitConfigList(process.env.DRIVE_TYPE_CONFIG || "115").filter((type) => ALLOWED_DRIVE_TYPES.has(type));
 // 读取环境变量:线路名称和顺序,用逗号/分号分割
 const SOURCE_NAMES_CONFIG = splitConfigList(process.env.SOURCE_NAMES_CONFIG || "本地代理;服务端代理;直连");
 // 是否开启外网服务器代理（默认关闭）
 const EXTERNAL_SERVER_PROXY_ENABLED = String(process.env.EXTERNAL_SERVER_PROXY_ENABLED || "false").toLowerCase() === "true";
 // 读取环境变量:详情页播放线路的网盘排序顺序。仅作用于 detail() 里的播放线路，不作用于搜索结果。
-const DRIVE_ORDER = splitConfigList(process.env.DRIVE_ORDER || "115;quark;uc;baidu;tianyi;xunlei;ali;123pan").map(s => s.toLowerCase());
+const DRIVE_ORDER = splitConfigList(process.env.DRIVE_ORDER || "baidu;115;guangya;ali").map(s => s.toLowerCase());
 // 详情链路缓存时间（秒），默认 12 小时
 const WONIU_CACHE_EX_SECONDS = Number(process.env.WONIU4K_CACHE_EX_SECONDS || process.env.WONIU_CACHE_EX_SECONDS || 43200);
 const WONIU_VERBOSE_DETAIL = String(process.env.WONIU4K_VERBOSE_DETAIL || process.env.MUOU_VERBOSE_DETAIL || "0") === "1";
@@ -70,7 +71,7 @@ const CAPTCHA_SERVICE_URL = String(process.env.DDDDOCR_API || "").replace(/\/+$/
 // PanCheck 网盘链接有效性检测（参考盘搜分组.js，POST {PANCHECK_API}/api/v1/links/check）
 const PANCHECK_API = String(process.env.PANCHECK_API || "").trim().replace(/\/+$/, "");
 const PANCHECK_ENABLED = true;
-const PANCHECK_PLATFORMS = splitConfigList(process.env.PANCHECK_PLATFORMS || "115,quark,baidu,uc,pan123,tianyi,cmcc")
+const PANCHECK_PLATFORMS = splitConfigList(process.env.PANCHECK_PLATFORMS || "115,baidu,aliyun")
   .map((p) => String(p).toLowerCase().trim())
   .filter(Boolean);
 // ==================== 配置区域结束 ====================
@@ -81,6 +82,7 @@ const PANCHECK_PLATFORMS = splitConfigList(process.env.PANCHECK_PLATFORMS || "11
  */
 function inferDriveTypeFromSourceName(name = "") {
   const raw = String(name || '').toLowerCase();
+  if (raw.includes('光鸭') || raw.includes('光雅') || raw.includes('guangya')) return 'guangya';
   if (raw.includes('百度')) return 'baidu';
   if (raw.includes('天翼')) return 'tianyi';
   if (raw.includes('夸克')) return 'quark';
@@ -420,7 +422,7 @@ function isBlockedHtml(body = "") {
 }
 
 function buildCacheKey(prefix, value) {
-  return `${prefix}:${value}`;
+  return `${prefix}:v110:${require("crypto").createHash("sha256").update(JSON.stringify([WEB_SITES, value])).digest("hex")}`;
 }
 
 function logDetailDebug(message) {
@@ -517,7 +519,12 @@ function extractPanUrl(raw) {
 }
 
 function isPanShareUrl(url = "") {
-  return /115|quark|aliyun|alipan|baidu|uc\.cn|123pan|189\.cn|xunlei|anxia/i.test(String(url || ""));
+  if (!ALLOWED_DRIVE_TYPES.has(inferDriveTypeFromShareURL(url))) return false;
+  try {
+    const parsed = new URL(url);
+    return /^\/s\/[^/]+/i.test(parsed.pathname) ||
+      (parsed.hostname === "pan.baidu.com" && /^\/share\/(?:init|link)(?:\/|$)/i.test(parsed.pathname));
+  } catch (_) { return false; }
 }
 
 function cleanContent(s) {
@@ -1518,7 +1525,7 @@ function extractPanUrls($) {
 
   // panlian_dark 模板
   $(".pan-link-item[data-pan-item]").each((_, el) => {
-    const candidates = [];
+    const candidates = [$(el).attr("data-pan-item")];
     $(el).find("[data-copy]").each((__, n) => candidates.push($(n).attr("data-copy")));
     $(el).find('a[href^="http"]').each((__, a) => candidates.push($(a).attr("href")));
     $(el).find(".pan-link-meta").each((__, m) => candidates.push($(m).text().trim()));
@@ -1532,14 +1539,14 @@ function extractPanUrls($) {
   });
 
   // 兜底：整页扫描分享链接
-  if (panUrls.length === 0) {
+  {
     const html = $.html() || "";
     const re =
-      /https?:\/\/(?:115cdn\.com|115\.com|anxia\.com|pan\.quark\.cn|www\.aliyundrive\.com|www\.alipan\.com|pan\.baidu\.com|drive\.uc\.cn|cloud\.189\.cn|www\.123pan\.com|pan\.xunlei\.com)\/[^\s"'<>]+/gi;
+      /https?:\/\/[^\s"'<>]+/gi;
     let m;
     while ((m = re.exec(html))) {
       const url = normalizeShareUrl(m[0]);
-      if (!url || seen.has(url)) continue;
+      if (!url || !isPanShareUrl(url) || seen.has(url)) continue;
       seen.add(url);
       panUrls.push(url);
     }
@@ -1589,14 +1596,14 @@ function extractPanItems($) {
   });
 
   // 兜底：整页扫描分享链接
-  if (items.length === 0) {
+  {
     const html = $.html() || "";
     const re =
-      /https?:\/\/(?:115cdn\.com|115\.com|anxia\.com|pan\.quark\.cn|www\.aliyundrive\.com|www\.alipan\.com|pan\.baidu\.com|drive\.uc\.cn|cloud\.189\.cn|www\.123pan\.com|pan\.xunlei\.com)\/[^\s"'<>]+/gi;
+      /https?:\/\/[^\s"'<>]+/gi;
     let m;
     while ((m = re.exec(html))) {
       const url = normalizeShareUrl(m[0]);
-      if (!url || seen.has(url)) continue;
+      if (!url || !isPanShareUrl(url) || seen.has(url)) continue;
       seen.add(url);
       items.push({ url, name: "" });
     }
@@ -1646,6 +1653,7 @@ function parseShareUrlWithTitle(raw = "") {
 }
 
 async function buildShareUrlDetail(shareURL, title = "") {
+  if (!isPanShareUrl(shareURL)) return { list: [] };
   const driveInfo = await getDriveInfoCached(shareURL);
   const displayName = driveInfo?.displayName || "网盘";
   const fileList = await getRootFileListCached(shareURL);
@@ -1682,6 +1690,8 @@ async function buildShareUrlDetail(shareURL, title = "") {
 async function detail(params, context) {
   try {
     const rawVideoId = params.videoId || params.id || params.vod_id || "";
+    const inputUrl = String(rawVideoId).split("|")[0];
+    if (/^https?:\/\//i.test(inputUrl) && inferDriveTypeFromShareURL(inputUrl) && !isPanShareUrl(inputUrl)) return { list: [] };
 
     // 影片分组跳转: 格式 "mvg:videoId"
     if (String(rawVideoId).startsWith("mvg:")) {
@@ -1998,23 +2008,27 @@ const PAN_NAMES = {
   baidu: "百度网盘",
   tianyi: "天翼云盘",
   aliyun: "阿里云盘",
+  guangya: "光鸭云盘",
   xunlei: "迅雷网盘",
   pan123: "123云盘",
   cmcc: "移动云盘",
 };
 
 function inferDriveTypeFromShareURL(shareURL = "") {
-  const raw = String(shareURL || "").toLowerCase();
-  if (!raw) return "";
-  if (raw.includes("pan.quark.cn") || raw.includes("drive.quark.cn")) return "quark";
-  if (raw.includes("drive.uc.cn") || raw.includes("fast.uc.cn")) return "uc";
-  if (raw.includes("pan.baidu.com")) return "baidu";
-  if (raw.includes("cloud.189.cn")) return "tianyi";
-  if (raw.includes("yun.139.com")) return "cmcc";
-  if (raw.includes("aliyundrive.com") || raw.includes("alipan.com")) return "aliyun";
-  if (raw.includes("pan.xunlei.com")) return "xunlei";
-  if (raw.includes("115.com") || raw.includes("115cdn.com") || raw.includes("anxia.com")) return "115";
-  if (raw.includes("123pan.com") || raw.includes("123684.com") || raw.includes("123865.com") || raw.includes("123912.com")) return "pan123";
+  let host;
+  try { host = new URL(String(shareURL || "")).hostname.toLowerCase(); }
+  catch (_) { return ""; }
+  const matches = (domain) => host === domain || host.endsWith(`.${domain}`);
+  if (matches("quark.cn")) return "quark";
+  if (matches("uc.cn")) return "uc";
+  if (matches("pan.baidu.com")) return "baidu";
+  if (matches("189.cn")) return "tianyi";
+  if (matches("139.com")) return "cmcc";
+  if (matches("aliyundrive.com") || matches("alipan.com")) return "aliyun";
+  if (matches("guangyapan.com")) return "guangya";
+  if (matches("xunlei.com")) return "xunlei";
+  if (["115.com", "115cdn.com", "anxia.com"].some(matches)) return "115";
+  if (["123pan.com", "123684.com", "123865.com", "123912.com"].some(matches)) return "pan123";
   return "";
 }
 
@@ -2098,7 +2112,7 @@ async function getVideoDriveTypes(videoId) {
     const driveTypes = new Set();
     for (const url of extractPanUrls($)) {
       const t = inferDriveTypeFromShareURL(url);
-      if (t) driveTypes.add(t);
+      if (ALLOWED_DRIVE_TYPES.has(t)) driveTypes.add(t);
     }
     return [...driveTypes];
   } catch (error) {
@@ -2182,8 +2196,7 @@ function buildMovieDriveGroups(videoId, vodName, vodPic, panUrls) {
   let unknown = 0;
   for (const url of (panUrls || [])) {
     const t = inferDriveTypeFromShareURL(url);
-    if (t) byType[t] = (byType[t] || 0) + 1;
-    else unknown += 1;
+    if (ALLOWED_DRIVE_TYPES.has(t)) byType[t] = (byType[t] || 0) + 1;
   }
   const items = [];
   for (const [driveType, count] of Object.entries(byType)) {
@@ -2216,6 +2229,7 @@ function buildMovieDriveGroups(videoId, vodName, vodPic, panUrls) {
 }
 
 async function searchLinksByDriveForMovie(videoId, driveType) {
+  if (!ALLOWED_DRIVE_TYPES.has(driveType)) return { list: [], page: 1, pagecount: 0, total: 0 };
   const cacheKey = buildCacheKey("woniu4k:searchDrive", `mv:${driveType}:${videoId}`);
   const cached = await getCachedJSON(cacheKey);
   if (cached && Array.isArray(cached.list) && cached.list.length > 0) {
@@ -2282,6 +2296,7 @@ async function searchLinksByDriveForMovie(videoId, driveType) {
 }
 
 async function searchVideosByDrive(keyword, page, driveType) {
+  if (!ALLOWED_DRIVE_TYPES.has(driveType)) return { list: [], page: 1, pagecount: 0, total: 0 };
   const cacheKey = buildCacheKey("woniu4k:searchDrive", `v7:${driveType}:${keyword}:${page}`);
   const cached = await getCachedJSON(cacheKey);
   if (cached && Array.isArray(cached.list) && cached.list.length > 0) {
@@ -2424,6 +2439,8 @@ async function search(params) {
       };
     }
 
+    if (/^https?:\/\//i.test(String(keyword)) && inferDriveTypeFromShareURL(keyword) && !isPanShareUrl(keyword)) return { list: [], page, pagecount: 0, total: 0 };
+
     // 支持直接搜索网盘链接
     if (/^https?:\/\//i.test(String(keyword)) && isPanShareUrl(keyword)) {
       return {
@@ -2480,8 +2497,11 @@ async function search(params) {
             total: groupedList.length,
           };
         }
+        OmniBox.log("info", "蜗牛4K 未发现百度/115/光鸭/阿里分享；详情受限时请检查站点登录状态");
+        return { list: [], page, pagecount: 1, total: 0 };
       } catch (error) {
-        OmniBox.log("warn", `蜗牛4K 搜索分组失败,回退原始列表: ${error.message}`);
+        OmniBox.log("warn", `蜗牛4K 搜索分组失败，跳过未确认结果: ${error.message}`);
+        return { list: [], page, pagecount: 0, total: 0 };
       }
     }
 
@@ -2542,6 +2562,8 @@ async function play(params, context) {
     if (!shareURL || !fileId) {
       throw new Error("分享链接或文件ID不能为空");
     }
+
+    if (!isPanShareUrl(shareURL)) return { urls: [], header: {}, parse: 0, danmaku: [] };
 
     OmniBox.log("info", `解析参数: shareURL=${shareURL}, fileId=${fileId}`);
 
