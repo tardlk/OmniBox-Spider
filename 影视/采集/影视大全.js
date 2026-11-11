@@ -1,15 +1,19 @@
 // @name 影视大全
 // @author 梦
-// @description 影视站：https://www.iysdq.tv ，支持首页、分类、搜索、详情与播放解析
-// @version 1.0.2
+// @description 固定入口：https://www.iysdq.me ，自动跟随站点搬迁，支持首页、分类、搜索、详情与播放解析
+// @version 1.0.3
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/影视大全.js
 // @dependencies cheerio
 
-const OmniBox = require("omnibox_sdk");
-const runner = require("spider_runner");
+let OmniBox, runner;
+try { OmniBox = require("omnibox_sdk"); } catch (_) { OmniBox = { log: (l,m) => console.error(`[${l}] ${m}`) }; }
+try { runner = require("spider_runner"); } catch (_) { runner = { run() {} }; }
 const cheerio = require("cheerio");
+const crypto = require("crypto");
 
-const HOST = "https://www.iysdq.tv";
+// HTML站点入口，可覆盖为新的固定入口或内容站；不复用采集API变量 SITE_API。
+const ENTRY = process.env.IYSDQ_HOST || "https://www.iysdq.me";
+let HOST = new URL(ENTRY).origin;
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const HEADERS = { "User-Agent": UA, Referer: `${HOST}/` };
 
@@ -21,8 +25,55 @@ const CLASS_LIST = [
   { type_id: "5", type_name: "短剧" },
 ];
 
-module.exports = { home, category, detail, search, play };
+module.exports = Object.fromEntries(Object.entries({ home, category, detail, search, play }).map(([name, fn]) => [name, withHost(name, fn)]));
 runner.run(module.exports);
+
+async function resolveHost(context) {
+  const key = "iysdq:host:v103:" + crypto.createHash("sha1").update(ENTRY).digest("hex");
+  try {
+    const cached = await OmniBox.getCache?.(key);
+    if (cached?.host && /^https?:\/\//.test(cached.host)) { HOST = new URL(cached.host).origin; return ""; }
+  } catch (_) {}
+  let current = new URL(ENTRY).href;
+  const seen = new Set();
+  for (let step = 0; step < 6; step++) {
+    if (seen.has(current)) throw new Error("站点入口循环跳转");
+    seen.add(current);
+    const html = await fetchText(current), $ = cheerio.load(html);
+    if ($("a.public-list-exp[href*='/voddetail/']").length) {
+      HOST = new URL(current).origin;
+      if (!context.prefetch) { try { await OmniBox.setCache?.(key, { host: HOST }, 600); } catch (_) {} }
+      await OmniBox.log("info", `[影视大全][入口] 已定位内容站 ${HOST}`);
+      return html;
+    }
+    // 只读取按钮、meta refresh 和字面量跳转，不执行远程脚本。
+    const scriptTarget = html.match(/(?:window\.)?location\.(?:replace|assign)\(\s*["']([^"']+)["']\s*\)/)?.[1];
+    const refresh = $("meta[http-equiv='refresh']").attr("content")?.match(/url\s*=\s*["']?([^"']+)/i)?.[1];
+    const target = $("#enterBtn").attr("href") || scriptTarget || refresh;
+    if (!target) throw new Error("站点返回入口/拦截页，未找到有效影片列表或跳转地址");
+    const next = new URL(target, current);
+    if (!/^https?:$/.test(next.protocol) || next.username || next.password) throw new Error("站点跳转地址无效");
+    if (/\/go\.html$/.test(next.pathname)) next.searchParams.set("t", String(Date.now()));
+    current = next.href;
+  }
+  throw new Error("站点入口跳转过多");
+}
+
+function withHost(name, fn) {
+  return async (params = {}, context = {}) => {
+    try {
+      await OmniBox.log("info", `[影视大全][${name}] 开始`);
+      const html = await resolveHost(context);
+      return await fn(params, { ...context, _homeHTML: html });
+    } catch (e) {
+      await OmniBox.log("error", `[影视大全][${name}] ${e.message}`);
+      if (name === "home") return { class: CLASS_LIST, list: [] };
+      if (name === "detail") return { list: [] };
+      if (name === "play") return { urls: [], flag: params.flag || "", parse: 0 };
+      return { page: Math.max(1, Number(params.page) || 1), pagecount: 0, total: 0, list: [] };
+    }
+  };
+}
 
 function getBodyText(res) {
   const body = res && typeof res === "object" && "body" in res ? res.body : res;
@@ -33,7 +84,11 @@ function getBodyText(res) {
 function absUrl(url) {
   const value = String(url || "").trim();
   if (!value) return "";
-  if (/^https?:\/\//i.test(value)) return value;
+  if (/^https?:\/\//i.test(value)) {
+    const url = new URL(value);
+    if (/^(?:www\.)?iysdq\d*\.(?:tv|me|com)$/i.test(url.hostname)) return new URL(url.pathname + url.search + url.hash, HOST).href;
+    return value;
+  }
   if (value.startsWith("//")) return `https:${value}`;
   if (value.startsWith("/")) return `${HOST}${value}`;
   return `${HOST}/${value.replace(/^\/+/, "")}`;
@@ -126,7 +181,9 @@ function buildDetailFromHtml(html, vodId) {
   let vodName = cleanText($(".this-desc-title").first().text());
   if (!vodName) vodName = cleanText($("h1").first().text());
 
-  let vodPic = absUrl($("img").first().attr("data-src") || $("img").first().attr("src") || "");
+  const detailImage = $(".this-pic img,.detail-pic img").first();
+  const background = $(".this-pic-bj").first().attr("style")?.match(/url\(\s*["']?([^"')]+)["']?\s*\)/i)?.[1];
+  let vodPic = absUrl($("meta[property='og:image']").attr("content") || detailImage.attr("data-src") || detailImage.attr("src") || background || "");
   if (!vodPic) {
     const pm = html.match(/<img[^>]*(?:data-src|src)="([^"]*(?:upload|cover|vod)[^"]*)"/i);
     vodPic = absUrl(pm ? pm[1] : "");
@@ -195,7 +252,7 @@ function buildDetailFromHtml(html, vodId) {
 
 async function home(params, context) {
   try {
-    const html = await fetchText(`${HOST}/`);
+    const html = context._homeHTML || await fetchText(`${HOST}/`);
     const list = extractHomeVideos(html);
     return { class: CLASS_LIST, filters: {}, list };
   } catch (e) {
@@ -226,7 +283,8 @@ async function detail(params, context) {
   try {
     const id = String(params.videoId || params.id || params.categoryId || "").trim();
     if (!id) return { list: [] };
-    const vodId = id.includes("/") ? (id.match(/(\d+)/) || ["", id])[1] : id;
+    const vodId = /^\d+$/.test(id) ? id : id.match(/\/voddetail\/(\d+)\.html(?:[?#]|$)/)?.[1];
+    if (!vodId) return { list: [] };
     const html = await fetchText(`${HOST}/voddetail/${vodId}.html`);
     const vod = buildDetailFromHtml(html, vodId);
     return { list: [vod] };
@@ -278,9 +336,9 @@ async function play(params, context) {
   try {
     const input = String(params.playId || params.url || params.input || "").trim();
     await OmniBox.log("info", `[影视大全][play] input=${input}`);
-    if (!input) return { parse: 0, jx: 0, url: "", header: {} };
+    if (!input) return { parse: 0, urls: [], flag: params.flag || "", header: {} };
 
-    const playUrl = input.startsWith("http") ? input : absUrl(input);
+    const playUrl = absUrl(input);
     await OmniBox.log("info", `[影视大全][play] playUrl=${playUrl}`);
     const html = await fetchText(playUrl, { referer: `${HOST}/` });
     await OmniBox.log("info", `[影视大全][play] htmlLen=${html.length}`);
@@ -288,6 +346,7 @@ async function play(params, context) {
     // 1) 直接解析 player_aaaa JSON
     let videoUrl = "";
     let playerRaw = "";
+    let flag = params.flag || "";
     const m = html.match(/var\s+player_aaaa\s*=\s*(\{[\s\S]*?\})\s*<\/script>/i)
       || html.match(/var\s+player_aaaa\s*=\s*(\{[\s\S]*?\})\s*;/i)
       || html.match(/player_aaaa\s*=\s*(\{[\s\S]*?\})\s*<\/script>/i)
@@ -299,6 +358,9 @@ async function play(params, context) {
       try {
         const data = JSON.parse(playerRaw);
         videoUrl = String(data.url || "").trim();
+        if (Number(data.encrypt) === 2) videoUrl = Buffer.from(videoUrl, "base64").toString("utf8");
+        if (Number(data.encrypt) === 1 || Number(data.encrypt) === 2) { try { videoUrl = decodeURIComponent(videoUrl); } catch (_) {} }
+        flag = flag || String(data.from || "");
         await OmniBox.log("info", `[影视大全][play] player_url=${videoUrl}`);
       } catch (err) {
         await OmniBox.log("error", `[影视大全][play] player json parse fail: ${err.message}`);
@@ -320,20 +382,20 @@ async function play(params, context) {
     }
 
     if (!videoUrl) {
-      return { parse: 0, jx: 0, url: "", header: {} };
+      return { parse: 0, urls: [], flag, header: {} };
     }
 
-    return {
-      parse: 0,
-      jx: 0,
-      url: videoUrl,
-      header: {
-        "User-Agent": UA,
-        Referer: `${HOST}/`,
-      },
-    };
+    if (!/^https?:\/\//i.test(videoUrl)) throw new Error("播放地址不是有效HTTP地址");
+    let header = { "User-Agent": UA, Referer: `${HOST}/` };
+    if (/douyinvod|byteimg|ixigua/.test(new URL(videoUrl).hostname)) delete header.Referer;
+    let parse = /\.(?:m3u8|mp4|mkv|flv|mpd)(?:[?#]|$)/i.test(videoUrl) ? 0 : 1;
+    if (parse) {
+      try { const r = await OmniBox.sniffVideo?.(videoUrl, header); if (r?.url && /^https?:\/\//i.test(r.url)) { videoUrl = r.url; header = r.header || header; parse = 0; } } catch (_) {}
+    }
+    return { parse, urls: [{ name: flag || "播放", url: videoUrl }], flag, header };
   } catch (e) {
     await OmniBox.log("error", `[影视大全][play] ${e.message}`);
-    return { parse: 0, jx: 0, url: "", header: {} };
+    return { parse: 0, urls: [], flag: params.flag || "", header: {} };
   }
 }
+
