@@ -1,7 +1,7 @@
 // @name 海量采集聚合
 // @author tardlk
 // @description JSON/XML采集接口聚合；排除成人源，按来源浏览，并行搜索，支持缓存、刮削及弹幕
-// @version 1.0.0
+// @version 1.0.1
 // @dependencies axios,cheerio
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/海量采集聚合.js
 
@@ -327,7 +327,7 @@ async function home(_params, context) {
   const result = { class: SOURCES.map(s => ({ type_id: s.id, type_name: s.name })), filters: {}, list: [] };
   for (const s of SOURCES) {
     const classes = classesOf(s).filter(c => !ADULT.test(c.type_name));
-    if (classes.length) result.filters[s.id] = [{ key: 'type', name: '类型', value: [{ n: '全部', v: '' }, ...classes.map(c => ({ n: c.type_name, v: c.type_id }))] }];
+    if (classes.length) result.filters[s.id] = [{ key: 'type', name: '类型', value: [{ name: '全部', value: '' }, ...classes.map(c => ({ name: c.type_name, value: c.type_id }))] }];
   }
   // 推荐只取前三个源，任意一个成功即返回，不扫描整个接口清单。
   for (const s of SOURCES.slice(0, 3)) {
