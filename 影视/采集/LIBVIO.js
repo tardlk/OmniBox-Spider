@@ -2,7 +2,7 @@
 // @author 梦
 // @description 刮削：已接入，弹幕：已接入，播放记录：宿主自动，嗅探：已接入（直链优先，加密线路回退网页嗅探，仅百度/115/光鸭/阿里网盘展开）
 // @dependencies
-// @version 1.6.0
+// @version 1.6.1
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/LIBVIO.js
 
 const http = require("http");
@@ -22,10 +22,6 @@ const HOST_CANDIDATES = [
     "https://libvio.host",
     "https://www.libvio.to",
     "https://libviobd.com",
-    "https://www.libvios.com",
-    "https://libvio.run",
-    "https://www.libvio.mov",
-    "https://www.libhd.com",
 ].map((item) => normalizeHost(item)).filter(Boolean);
 const LIBVIO_RELEASE_URL = "https://www.libvio.app";
 const HOST_CACHE_KEY = "libvio:active_host:v159";
@@ -165,9 +161,19 @@ function buildHeadersForHost(host, extra = {}) {
         "User-Agent": UA,
         "Referer": `${host}/`,
         "Origin": host,
+        "Accept-Encoding": "gzip, deflate, br",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         ...extra,
     };
+}
+
+// 推荐区位于全部播放/网盘列表之后。只在明确遇到该边界时提前结束，不能按任意 </ul> 截断。
+function completeDetailPrefix(html = "") {
+    const marker = /<h3\b[^>]*>(?:(?!<\/h3>)[\s\S])*?(?:猜你喜欢|相关推荐)(?:(?!<\/h3>)[\s\S])*?<\/h3>/i.exec(html);
+    if (!marker) return "";
+    const prefix = html.slice(0, marker.index);
+    return /<h1\b[^>]*>[\s\S]*?<\/h1>/i.test(prefix)
+        && /<ul\b[^>]*class=["'][^"']*stui-content__playlist[^"']*["'][^>]*>[\s\S]*?<\/ul>/i.test(prefix) ? prefix : "";
 }
 
 async function requestTextAbsolute(url, options = {}, redirects = 0) {
@@ -176,37 +182,55 @@ async function requestTextAbsolute(url, options = {}, redirects = 0) {
     const lib = target.protocol === "https:" ? https : http;
     const hostForHeaders = normalizeHost(options.hostForHeaders || target.origin);
     return await new Promise((resolve, reject) => {
-        // 总超时覆盖 DNS、TLS 和持续传输，避免域名故障无限等待。
+        let settled = false;
         const timer = setTimeout(() => req.destroy(new Error(`请求超时: ${target.href}`)), options.timeout || 15000);
-        const finish = (error, body) => { clearTimeout(timer); error ? reject(error) : resolve(body); };
+        const finish = (error, body) => {
+            if (settled) return;
+            settled = true; clearTimeout(timer); error ? reject(error) : resolve(body);
+        };
         const req = lib.request(target, {
             method: options.method || "GET",
             headers: buildHeadersForHost(hostForHeaders, options.headers || {}),
+            ...(options.freshConnection ? { agent: false } : {}),
         }, (res) => {
             const status = Number(res.statusCode || 0);
             if ([301, 302, 303, 307, 308].includes(status) && res.headers.location) {
-                res.resume(); clearTimeout(timer);
-                if (redirects >= 5) return reject(new Error("重定向次数过多"));
+                res.resume();
+                if (redirects >= 5) return finish(new Error("重定向次数过多"));
                 const next = new URL(res.headers.location, target);
-                if (isSiteHost(target.href) && !isSiteHost(next.href)) return reject(new Error("站点重定向到了非 LIBVIO 域名"));
-                requestTextAbsolute(next.href, { ...options, hostForHeaders: next.origin }, redirects + 1).then(resolve, reject);
+                if (isSiteHost(target.href) && !isSiteHost(next.href)) return finish(new Error("站点重定向到了非 LIBVIO 域名"));
+                requestTextAbsolute(next.href, { ...options, hostForHeaders: next.origin }, redirects + 1).then(body => finish(null, body), error => finish(error));
                 return;
             }
+            if (status < 200 || status >= 300) {
+                res.resume();
+                const error = new Error(`请求失败: ${status} ${target.href}`); error.statusCode = status;
+                finish(error); return;
+            }
+            const encoding = String(res.headers["content-encoding"] || "").toLowerCase();
+            const decoder = encoding === "gzip" ? zlib.createGunzip() : encoding === "deflate" ? zlib.createInflate() : encoding === "br" ? zlib.createBrotliDecompress() : null;
+            const stream = decoder ? res.pipe(decoder) : res;
             const chunks = [];
             let size = 0;
-            res.on("data", chunk => { size += chunk.length; if (size > 8 * 1024 * 1024) req.destroy(new Error("页面过大")); else chunks.push(chunk); });
-            res.on("error", error => finish(error));
-            res.on("end", () => {
-                if (status < 200 || status >= 300) return finish(new Error(`请求失败: ${status} ${target.href}`));
-                try {
-                    let data = Buffer.concat(chunks);
-                    const encoding = String(res.headers["content-encoding"] || "").toLowerCase();
-                    if (encoding === "gzip") data = zlib.gunzipSync(data);
-                    else if (encoding === "deflate") data = zlib.inflateSync(data);
-                    else if (encoding === "br") data = zlib.brotliDecompressSync(data);
-                    finish(null, data.toString("utf8"));
-                } catch (error) { finish(error); }
+            const detailPage = isSiteHost(target.href) && /^\/detail\/\d+\.html$/.test(target.pathname);
+            stream.on("data", chunk => {
+                if (settled) return;
+                size += chunk.length;
+                if (size > 8 * 1024 * 1024) { finish(new Error("页面过大")); req.destroy(); return; }
+                chunks.push(chunk);
+                if (detailPage) {
+                    const prefix = completeDetailPrefix(Buffer.concat(chunks).toString("utf8"));
+                    if (prefix) {
+                        logInfo("详情主体已完整接收，停止读取推荐区", { url: target.href, bytes: size });
+                        finish(null, prefix); req.destroy();
+                        if (decoder) decoder.destroy();
+                    }
+                }
             });
+            stream.on("error", error => finish(error));
+            res.on("error", error => finish(error));
+            res.on("aborted", () => finish(new Error(`响应中断: ${target.href}`)));
+            stream.on("end", () => finish(null, Buffer.concat(chunks).toString("utf8")));
         });
         req.on("error", error => finish(error));
         req.end();
@@ -268,14 +292,27 @@ async function requestText(url, options = {}) {
     await ensureActiveHost();
     const path = /^https?:\/\//i.test(raw) ? new URL(raw).pathname + new URL(raw).search : (raw.startsWith("/") ? raw : `/${raw}`);
     if (path === "/" && probedHome) { const html = probedHome; probedHome = ""; return html; }
-    try { return await requestTextAbsolute(`${ACTIVE_HOST}${path}`, { ...options, hostForHeaders: ACTIVE_HOST }); }
+    const failedHost = ACTIVE_HOST;
+    try { return await requestTextAbsolute(`${failedHost}${path}`, { ...options, hostForHeaders: failedHost }); }
     catch (error) {
-        // 实际页面请求失败后重新发现站点，兼容域名失效和旧收藏链接。
         if (options.failover === false) throw error;
-        const failedHost = ACTIVE_HOST;
+        const transient = /超时|响应中断|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|ECONNREFUSED/i.test(`${error.code || ""} ${error.message}`)
+            || Number(error.statusCode) >= 500;
+        if (transient) {
+            logInfo("页面暂时失败，先重试原域名", { host: failedHost, path, error: error.message });
+            try {
+                return await requestTextAbsolute(`${failedHost}${path}`, { ...options, timeout: Math.min(options.timeout || 15000, 8000), hostForHeaders: failedHost, freshConnection: true });
+            } catch (retryError) { logInfo("原域名重试失败，尝试备用入口", { host: failedHost, error: retryError.message }); }
+        }
         hostReady = false; probedHome = "";
-        await ensureActiveHost(failedHost);
-        return await requestTextAbsolute(`${ACTIVE_HOST}${path}`, { ...options, hostForHeaders: ACTIVE_HOST });
+        try {
+            await ensureActiveHost(failedHost);
+            return await requestTextAbsolute(`${ACTIVE_HOST}${path}`, { ...options, hostForHeaders: ACTIVE_HOST });
+        } catch (fallbackError) {
+            // 单个页面失败不能抹掉原站的可用状态，更不能把它描述成所有内容域名永久失效。
+            ACTIVE_HOST = failedHost; hostReady = true;
+            throw new Error(`页面获取失败: ${path}; 原因: ${error.message}; 备用入口未恢复: ${fallbackError.message}`);
+        }
     }
 }
 
@@ -290,7 +327,7 @@ function buildCacheKey(prefix = "", ...parts) {
         .filter((item) => item !== "");
     const raw = rawParts.join("|");
     const short = raw ? md5Short(raw) : "empty";
-    return `${prefix}:v160:${short}`;
+    return `${prefix}:v161:${short}`;
 }
 
 async function getCachedText(cacheKey, ttl, producer) {
