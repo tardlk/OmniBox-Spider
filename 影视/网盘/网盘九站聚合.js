@@ -2,7 +2,7 @@
 // @author @Tao_XG
 // @description 聚合玩偶、木偶、蜡笔、闪电、多多、欧哥、花卷、虎斑、小斑；24 个主备入口，同名搜索合并，仅保留115/阿里/百度/光鸭资源，支持网盘展开、刮削、弹幕和播放
 // @dependencies axios,cheerio
-// @version 1.2.2
+// @version 1.2.3
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/网盘/网盘九站聚合.js
 // 基于 tardlk/OmniBox-Spider 的玩偶聚合-非分组 v1.0.1。
 
@@ -323,6 +323,19 @@ async function setCachedJSON(key, value, exSeconds) {
   } catch (error) {
     await OmniBox.log("warn", `[cache] 写入缓存失败: key=${key}, err=${error.message}`);
   }
+}
+
+// 结果缓存只包含站点元数据、分享链接和文件ID，不保存播放直链或网盘授权。
+function resultCacheScope(context = {}) {
+  return {
+    sourceId: context.sourceId || "", from: context.from || "web",
+    sites: SITES.map((site) => [site.id, site.domains]),
+    driveOrder: DRIVE_ORDER, siteOrder: PAN_SITE_ORDER,
+    sourceNames: SOURCE_NAMES_CONFIG, driveTypes: DRIVE_TYPE_CONFIG,
+    cap: PAN_MAX_LINKS_PER_DRIVE, mergeMax: MERGE_MAX_SITES,
+    markers: MERGE_VERSION_WORDS, scrape: ENABLE_SCRAPE,
+    searchBudget: SEARCH_TIMEOUT_BUDGET_MS,
+  };
 }
 
 async function getDriveInfoCached(shareURL) {
@@ -931,7 +944,9 @@ async function fetchSiteSearch(site, keyword, page = 1, options = {}) {
       }
     });
 
-    await OmniBox.log("info", `[search] site=${site.name}, page=${page}, hit=${videos.length}`);
+    videos._pagecount = Math.max(page, parseTotalPages($));
+    videos._success = true;
+    await OmniBox.log("info", `[search] site=${site.name}, page=${page}, hit=${videos.length}, pages=${videos._pagecount}`);
     return videos;
   } catch (error) {
     await OmniBox.log("error", `[search] site=${site.name} fail: ${error.message}`);
@@ -2089,10 +2104,20 @@ async function detail(params, context) {
     const drives = context?.drives || [];
     await OmniBox.log("info", `[detail] videoId=${videoId}`);
     if (!videoId) return { list: [] };
+    const cacheKey = buildCacheKey("nine:detailResult:v123", JSON.stringify([videoId, resultCacheScope(context)]));
+    const cached = params.refresh === true ? null : await getCachedJSON(cacheKey);
+    if (cached && Array.isArray(cached.list) && cached.list.some((vod) => vod?.vod_play_sources?.some((source) => source.episodes?.length))) {
+      await OmniBox.log("info", `[detail-cache] 命中完整线路缓存: sources=${cached.list[0].vod_play_sources.length}, ttl=120s`);
+      return cached;
+    }
     const data = String(videoId).startsWith(MERGE_PREFIX)
       ? await handleMergedDetail(videoId, drives, context)
       : await handleSiteDetail(videoId, drives, context);
-    return { list: data ? [data] : [] };
+    const response = { list: data ? [data] : [] };
+    if (data?.vod_play_sources?.some((source) => source.episodes?.length)) {
+      await setCachedJSON(cacheKey, response, 120);
+    }
+    return response;
   } catch (error) {
     await OmniBox.log("error", `[detail] ${error.message}`);
     return { list: [] };
@@ -2101,17 +2126,62 @@ async function detail(params, context) {
 
 async function search(params, context) {
   try {
-    const keyword = params.keyword || "";
-    const page = parseInt(params.page || "1", 10);
+    const keyword = String(params.keyword || "").trim();
+    const page = Math.max(1, parseInt(params.page || "1", 10) || 1);
     await OmniBox.log("info", `[search] keyword=${keyword}, page=${page}`);
     if (!keyword) return { list: [], page: 1, pagecount: 0, total: 0 };
-
-    const resultsArrays = await Promise.all(
-      SITES.map((site) => fetchSiteSearch(site, keyword, page, { budgetMs: SEARCH_TIMEOUT_BUDGET_MS }))
-    );
+    const identity = JSON.stringify([keyword, resultCacheScope(context)]);
+    const cacheKey = buildCacheKey("nine:searchResult:v123", `${identity}:${page}`);
+    const progressKey = buildCacheKey("nine:searchPages:v123", identity);
+    const cached = params.refresh === true ? null : await getCachedJSON(cacheKey);
+    if (cached && Array.isArray(cached.list)) {
+      await OmniBox.log("info", `[search-cache] 命中搜索结果: page=${page}, count=${cached.list.length}, ttl=60s`);
+      return cached;
+    }
+    const prior = params.refresh === true ? null : await getCachedJSON(progressKey);
+    const pageCounts = { ...(prior?.pageCounts || {}) };
+    const failedUntil = { ...(prior?.failedUntil || {}) };
+    const resultsArrays = await Promise.all(SITES.map(async (site) => {
+      if (failedUntil[site.id] > Date.now()) {
+        await OmniBox.log("info", `[search-page] ${site.name} 暂时不可达，60秒内复用已有结果`);
+        return [];
+      }
+      if (Number.isFinite(pageCounts[site.id]) && page > pageCounts[site.id]) {
+        await OmniBox.log("info", `[search-page] ${site.name} 已到末页${pageCounts[site.id]}，跳过第${page}页`);
+        const empty = [];
+        empty._success = true;
+        empty._pagecount = pageCounts[site.id];
+        return empty;
+      }
+      return fetchSiteSearch(site, keyword, page, { budgetMs: SEARCH_TIMEOUT_BUDGET_MS });
+    }));
+    let successCount = 0;
+    resultsArrays.forEach((items, index) => {
+      const siteId = SITES[index].id;
+      if (!items._success) {
+        if (!(failedUntil[siteId] > Date.now())) failedUntil[siteId] = Date.now() + 60000;
+        return;
+      }
+      successCount++;
+      delete failedUntil[siteId];
+      pageCounts[siteId] = items._pagecount;
+    });
     const allResults = await filterSearchResultsByDrive(mergeSearchResults(resultsArrays));
-    await OmniBox.log("info", `[search] mergedTotal=${allResults.length}`);
-    return { list: allResults, page, pagecount: 1, total: allResults.length };
+    const knownLastPage = Math.max(1, ...Object.values(pageCounts));
+    const hasUnknownSites = SITES.some((site) => !Number.isFinite(pageCounts[site.id]));
+    const response = {
+      list: allResults, page,
+      // 不把请求失败猜成“还有下一页”，避免宿主反复加载空页。
+      pagecount: knownLastPage,
+      total: allResults.length,
+    };
+    if (successCount) {
+      await setCachedJSON(progressKey, { pageCounts, failedUntil }, 60);
+      // 保留已经获得的结果；短暂隔离失败站，避免一次慢站拖慢所有重复查询。
+      await setCachedJSON(cacheKey, response, 60);
+    }
+    await OmniBox.log("info", `[search] mergedTotal=${allResults.length}, pagecount=${response.pagecount}, partial=${hasUnknownSites}`);
+    return response;
   } catch (error) {
     await OmniBox.log("error", `[search] ${error.message}`);
     return { list: [], page: 1, pagecount: 0, total: 0 };
