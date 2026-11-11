@@ -2,8 +2,8 @@
 // @author @Tao_XG
 // @description 聚合玩偶、木偶、蜡笔、闪电、多多、欧哥、花卷、虎斑、小斑；24 个主备入口，同名搜索合并，仅保留115/阿里/百度/光鸭资源，支持网盘展开、刮削、弹幕和播放
 // @dependencies axios,cheerio
-// @version 1.2.0
-// @downloadURL https://raw.githubusercontent.com/tardlk/OmniBox-Spider/main/影视/网盘/网盘九站聚合.js
+// @version 1.2.1
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/网盘/网盘九站聚合.js
 // 基于 tardlk/OmniBox-Spider 的玩偶聚合-非分组 v1.0.1。
 
 const OmniBox = require("omnibox_sdk");
