@@ -2,7 +2,7 @@
 // @author @Tao_XG
 // @description 聚合玩偶、木偶、蜡笔、闪电、多多、欧哥、花卷、虎斑、小斑；24 个主备入口，同名搜索合并，仅保留115/阿里/百度/光鸭资源，支持网盘展开、刮削、弹幕和播放
 // @dependencies axios,cheerio
-// @version 1.2.3
+// @version 1.2.4
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/网盘/网盘九站聚合.js
 // 基于 tardlk/OmniBox-Spider 的玩偶聚合-非分组 v1.0.1。
 
@@ -15,7 +15,10 @@ const runner = require("spider_runner");
 const { AsyncLocalStorage } = require("async_hooks");
 const handlerContext = new AsyncLocalStorage();
 function withContext(handler) {
-  return (params = {}, context = {}) => handlerContext.run(context, () => handler(params, context));
+  return (params = {}, context = {}) => handlerContext.run(context, async () => {
+    const response = await handler(params, context);
+    return formatCoverResponse(response, context, handler.name);
+  });
 }
 function isPrefetch() { return handlerContext.getStore()?.prefetch === true; }
 
@@ -866,6 +869,78 @@ async function getEpisodesFromDrive(url, driveKey, drives, source = "") {
   }
 }
 
+// ==================== 封面提取与客户端输出 ====================
+function normalizeCoverUrl(raw, baseURL = "") {
+  let value = String(raw || "").trim()
+    .replace(/&amp;|&#0*38;|&#x0*26;/gi, "&")
+    .replace(/\\u0026/gi, "&").replace(/\\\//g, "/");
+  const css = value.match(/^url\(\s*["']?(.*?)["']?\s*\)$/i);
+  if (css) value = css[1];
+  if (!value || /^(?:data|javascript|about):/i.test(value)) return "";
+  try {
+    let url = new URL(value, baseURL || undefined);
+    if (!/^https?:$/.test(url.protocol)) return "";
+    // 百度中转地址含多个 &，部分客户端会把JSON中的转义原样带入图片请求。
+    // 还原真实源图，再由宿主代理，避免输出这类多参数路径。
+    if (/^gimg\d*\.baidu\.com$/i.test(url.hostname)) {
+      const match = url.href.match(/[?&]src=([^&]+)/i);
+      if (match) {
+        let source = match[1];
+        try { source = decodeURIComponent(source); } catch (_) {}
+        url = new URL(/^https?:\/\//i.test(source) ? source : `https://${source.replace(/^\/\//, "")}`);
+      }
+    }
+    if (!/^https?:$/.test(url.protocol) || url.pathname === "/") return "";
+    if (/(?:^|\/)(?:load(?:ing)?|lazyload|blank|no[-_]?pic|no[-_]?img|placeholder|transparent|default)(?:[-_.]|$)/i.test(url.pathname)) return "";
+    return url.href;
+  } catch (_) { return ""; }
+}
+
+function pickCoverUrl($, scope, baseURL, detail = false) {
+  const candidates = [];
+  if (detail) candidates.push($("meta[property='og:image'],meta[name='og:image']").first().attr("content"));
+  const collect = (el) => {
+    const node = $(el);
+    for (const attr of ["data-original", "data-src", "data-lazy-src", "data-poster", "poster"]) candidates.push(node.attr(attr));
+    for (const attr of ["data-srcset", "srcset"]) {
+      const set = node.attr(attr);
+      if (set) candidates.push(set.split(",")[0].trim().split(/\s+/)[0]);
+    }
+    candidates.push(node.attr("src"));
+    const background = String(node.attr("style") || "").match(/background(?:-image)?\s*:\s*(url\([^)]*\))/i);
+    if (background) candidates.push(background[1]);
+  };
+  scope.each((_, el) => collect(el));
+  scope.find("a[data-original],a[data-src],img,source").each((_, el) => collect(el));
+  for (const candidate of candidates) {
+    const url = normalizeCoverUrl(candidate, baseURL);
+    if (url) return url;
+  }
+  return "";
+}
+
+function clientCoverUrl(raw, context = {}) {
+  const image = normalizeCoverUrl(raw);
+  if (!image) return "";
+  try {
+    const base = new URL(context.baseURL || "");
+    if (!/^https?:$/.test(base.protocol)) return image;
+    const target = new URL(image);
+    if (target.origin === base.origin && target.pathname.endsWith("/api/proxy/image")) return image;
+    const referer = /(?:^|\.)doubanio\.com$/i.test(target.hostname) ? "https://movie.douban.com/" : `${target.origin}/`;
+    return `${base.href.replace(/\/+$/, "")}/api/proxy/image?url=${encodeURIComponent(`${image}@Referer=${referer}`)}`;
+  } catch (_) { return image; }
+}
+
+async function formatCoverResponse(response, context, method) {
+  if (!response || !Array.isArray(response.list)) return response;
+  // 原始源图留在缓存中，按本次请求的baseURL输出代理，避免串用旧域名或内部地址。
+  const list = response.list.map((item) => ({ ...item, vod_pic: clientCoverUrl(item.vod_pic, context) }));
+  const sample = list.find((item) => item.vod_pic);
+  await OmniBox.log("info", `[cover][${method}] total=${list.length}, withPic=${list.filter((item) => item.vod_pic).length}, mode=${context.baseURL ? "host-proxy" : "direct"}, sample=${sample?.vod_pic || "<empty>"}`);
+  return { ...response, list };
+}
+
 // ==================== 站点抓取 ====================
 async function fetchSiteSearch(site, keyword, page = 1, options = {}) {
   const searchUrl = buildSearchUrl(site, keyword, page);
@@ -901,20 +976,7 @@ async function fetchSiteSearch(site, keyword, page = 1, options = {}) {
         .replace(/\s+/g, " ")
         .replace(/^立刻播放|^下载/g, "")
         .trim();
-      let vodPic =
-        $item.find(".module-item-pic img").attr("data-src") ||
-        $item.find(".module-item-pic img").attr("data-original") ||
-        $item.find(".module-item-pic img").attr("src") ||
-        $item.find("img").first().attr("data-src") ||
-        $item.find("img").first().attr("data-original") ||
-        $item.find("img").first().attr("src");
-      if (vodPic && vodPic.includes("loading.gif")) {
-        vodPic =
-          $item.find("img").first().attr("data-src") ||
-          $item.find("img").first().attr("data-original") ||
-          "";
-      }
-      if (vodPic && !vodPic.startsWith("http")) vodPic = baseUrl + vodPic;
+      const vodPic = pickCoverUrl($, $item, baseUrl);
       const vodRemarks =
         $item.find(".module-item-text").text().trim() ||
         $item.find(".module-item-note").text().trim() ||
@@ -1189,20 +1251,7 @@ async function fetchSiteCategoryList(site, categoryId, page = 1, filters = {}) {
       .replace(/\s+/g, " ")
       .replace(/^立刻播放|^下载/g, "")
       .trim();
-    let vodPic =
-      $item.find(".module-item-pic img").attr("data-src") ||
-      $item.find(".module-item-pic img").attr("data-original") ||
-      $item.find(".module-item-pic img").attr("src") ||
-      $item.find("img").first().attr("data-src") ||
-      $item.find("img").first().attr("data-original") ||
-      $item.find("img").first().attr("src");
-    if (vodPic && vodPic.includes("loading.gif")) {
-      vodPic =
-        $item.find("img").first().attr("data-src") ||
-        $item.find("img").first().attr("data-original") ||
-        "";
-    }
-    if (vodPic && !vodPic.startsWith("http")) vodPic = baseUrl + vodPic;
+    const vodPic = pickCoverUrl($, $item, baseUrl);
     const vodRemarks =
       $item.find(".module-item-text").text().trim() ||
       $item.find(".module-item-note").text().trim() ||
@@ -1232,7 +1281,7 @@ async function fetchSiteCategoryList(site, categoryId, page = 1, filters = {}) {
 }
 
 async function fetchSiteDetail(site, videoId, options = {}) {
-  const key = buildCacheKey("nine:detail:v120", `${site.id}:${videoId}`);
+  const key = buildCacheKey("nine:detail:v124", `${site.id}:${videoId}`);
   const cached = await getCachedJSON(key);
   if (cached && Array.isArray(cached.panUrls)) {
     return { ...cached, panUrls: cached.panUrls.filter(isAllowedShareUrl) };
@@ -1254,19 +1303,9 @@ async function fetchSiteDetailUncached(site, videoId, options = {}) {
     $(".mobile-detail-title").first().text().replace(/\s+/g, " ").trim() ||
     $(".premium-title").first().text().replace(/\s+/g, " ").trim() ||
     "";
-  let vodPic =
-    $(".mobile-play .lazyload").attr("data-src") ||
-    $(".module-item-pic img,.module-info-poster img,.video-cover img,img.lazyload,img.lazy,.premium-poster img")
-      .first()
-      .attr("data-src") ||
-    $(".module-item-pic img,.module-info-poster img,.video-cover img,img.lazyload,img.lazy,.premium-poster img")
-      .first()
-      .attr("data-original") ||
-    $(".module-item-pic img,.module-info-poster img,.video-cover img,img.lazyload,img.lazy,.premium-poster img")
-      .first()
-      .attr("src") ||
-    "";
-  if (vodPic && !vodPic.startsWith("http")) vodPic = baseUrl + vodPic;
+  let coverScope = $(".module-info-poster,.video-cover,.mobile-play,.premium-poster");
+  if (!coverScope.length) coverScope = $(".module-item-pic,img.lazyload,img.lazy").first();
+  const vodPic = pickCoverUrl($, coverScope, baseUrl, true);
 
   let vodYear = "";
   let vodDirector = "";
@@ -1511,7 +1550,10 @@ function buildEpisodesForLabel(result, displayLabel, effectiveSourceNamesConfig)
 function applyScrapeMetadataToDetail(target, scrapeData) {
   if (!scrapeData) return;
   if (scrapeData.title) target.vodName = scrapeData.title;
-  if (scrapeData.posterPath) target.vodPic = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
+  if (!normalizeCoverUrl(target.vodPic) && scrapeData.posterPath) {
+    const poster = String(scrapeData.posterPath);
+    target.vodPic = normalizeCoverUrl(/^\/(?!\/)/.test(poster) ? `https://image.tmdb.org/t/p/w500${poster}` : poster, "https://image.tmdb.org/t/p/w500/");
+  }
   if (scrapeData.releaseDate) target.vodYear = scrapeData.releaseDate.substring(0, 4);
   if (scrapeData.overview) target.vodContent = scrapeData.overview;
   if (scrapeData.credits) {
@@ -2104,7 +2146,7 @@ async function detail(params, context) {
     const drives = context?.drives || [];
     await OmniBox.log("info", `[detail] videoId=${videoId}`);
     if (!videoId) return { list: [] };
-    const cacheKey = buildCacheKey("nine:detailResult:v123", JSON.stringify([videoId, resultCacheScope(context)]));
+    const cacheKey = buildCacheKey("nine:detailResult:v124", JSON.stringify([videoId, resultCacheScope(context)]));
     const cached = params.refresh === true ? null : await getCachedJSON(cacheKey);
     if (cached && Array.isArray(cached.list) && cached.list.some((vod) => vod?.vod_play_sources?.some((source) => source.episodes?.length))) {
       await OmniBox.log("info", `[detail-cache] 命中完整线路缓存: sources=${cached.list[0].vod_play_sources.length}, ttl=120s`);
@@ -2131,7 +2173,7 @@ async function search(params, context) {
     await OmniBox.log("info", `[search] keyword=${keyword}, page=${page}`);
     if (!keyword) return { list: [], page: 1, pagecount: 0, total: 0 };
     const identity = JSON.stringify([keyword, resultCacheScope(context)]);
-    const cacheKey = buildCacheKey("nine:searchResult:v123", `${identity}:${page}`);
+    const cacheKey = buildCacheKey("nine:searchResult:v124", `${identity}:${page}`);
     const progressKey = buildCacheKey("nine:searchPages:v123", identity);
     const cached = params.refresh === true ? null : await getCachedJSON(cacheKey);
     if (cached && Array.isArray(cached.list)) {
