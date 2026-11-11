@@ -1,8 +1,8 @@
 // @name LIBVIO
 // @author 梦
-// @description 刮削：已接入，弹幕：已接入，播放记录：宿主自动，嗅探：已接入（直链优先，加密线路回退网页嗅探，支持网盘展开）
+// @description 刮削：已接入，弹幕：已接入，播放记录：宿主自动，嗅探：已接入（直链优先，加密线路回退网页嗅探，仅百度/115/光鸭/阿里网盘展开）
 // @dependencies
-// @version 1.5.9
+// @version 1.6.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/LIBVIO.js
 
 const http = require("http");
@@ -44,9 +44,11 @@ const DETAIL_CACHE_TTL = 60 * 20;
 const FILTER_CACHE_TTL = 60 * 20;
 const PAN_SHARE_CACHE_TTL = 60 * 60;
 const PLAY_CACHE_TTL = 60 * 3;
-const DRIVE_TYPE_CONFIG = (process.env.DRIVE_TYPE_CONFIG || "quark;uc").split(";").map((t) => t.trim().toLowerCase()).filter(Boolean);
+const ALLOWED_DRIVES = new Set(["baidu", "115", "guangya", "ali"]);
+const DRIVE_NAMES = { baidu: "百度网盘", "115": "115网盘", guangya: "光鸭网盘", ali: "阿里网盘" };
+const DRIVE_TYPE_CONFIG = (process.env.DRIVE_TYPE_CONFIG || "115").split(";").map((t) => t.trim().toLowerCase()).filter(t => ALLOWED_DRIVES.has(t));
 const SOURCE_NAMES_CONFIG = (process.env.SOURCE_NAMES_CONFIG || "本地代理;服务端代理;直连").split(";").map((s) => s.trim()).filter(Boolean);
-const DRIVE_ORDER = (process.env.DRIVE_ORDER || "baidu;tianyi;quark;uc;115;xunlei;ali;123pan").split(";").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const DRIVE_ORDER = (process.env.DRIVE_ORDER || "baidu;115;guangya;ali").split(";").map((s) => s.trim().toLowerCase()).filter(Boolean);
 const panShareCache = new Map();
 
 // 分类映射（根据实际页面结构更新）
@@ -288,7 +290,7 @@ function buildCacheKey(prefix = "", ...parts) {
         .filter((item) => item !== "");
     const raw = rawParts.join("|");
     const short = raw ? md5Short(raw) : "empty";
-    return `${prefix}:v159:${short}`;
+    return `${prefix}:v160:${short}`;
 }
 
 async function getCachedText(cacheKey, ttl, producer) {
@@ -809,6 +811,7 @@ function parseVodList(html = "") {
 
 function normalizePanSourceName(name = "") {
     const text = stripTags(name);
+    if (/光鸭|光雅|guangya/i.test(text)) return "光鸭网盘";
     if (/UC/i.test(text)) return "UC网盘";
     if (/百度/i.test(text)) return "百度网盘";
     if (/夸克/i.test(text)) return "夸克网盘";
@@ -864,7 +867,7 @@ function extractPlaylistSources(html = "", videoId = "", vodName = "") {
 
             for (const item of listHtml.matchAll(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)) {
                 const playUrl = fixUrl(item[1] || "");
-                if (!isCollectPlayHref(playUrl)) continue;
+                if (!isCollectPlayHref(playUrl) && !isPanUrl(playUrl)) continue;
                 const episodeName = stripTags(item[2] || "") || `第${episodes.length + 1}集`;
                 const dedupeKey = `${playUrl}@@${episodeName}`;
                 if (seenEpisodes.has(dedupeKey)) continue;
@@ -925,16 +928,37 @@ function parseMetaItems(html = "") {
     return ensureArray(html.match(/<span class="meta-item">([\s\S]*?)<\/span>/g)).map((item) => stripTags(item));
 }
 
-function isPanUrl(url = "") {
-    const u = String(url || "").toLowerCase();
-    return u.includes("pan.baidu.com") || u.includes("quark.cn") || u.includes("pan.quark.cn") || u.includes("drive.uc.cn") || u.includes("aliyundrive.com") || u.includes("alipan.com") || u.includes("xunlei.com") || u.includes("cloud.189.cn") || u.includes("115.com") || u.includes("123pan.com");
+function detectShareDrive(url = "") {
+    try {
+        const target = new URL(normalizeShareUrl(url));
+        if (!/^https?:$/.test(target.protocol) || target.username || target.password) return "";
+        const host = target.hostname.toLowerCase();
+        const matches = domain => host === domain || host.endsWith(`.${domain}`);
+        if (matches("pan.baidu.com")) return "baidu";
+        if (["115.com", "115cdn.com", "anxia.com"].some(matches)) return "115";
+        if (matches("guangyapan.com")) return "guangya";
+        if (matches("alipan.com") || matches("aliyundrive.com")) return "ali";
+        if (matches("quark.cn")) return "quark";
+        if (matches("uc.cn")) return "uc";
+        if (matches("xunlei.com")) return "xunlei";
+        if (matches("189.cn")) return "tianyi";
+        if (matches("123pan.com") || matches("123865.com")) return "123pan";
+    } catch {}
+    return "";
+}
+
+function isPanUrl(url = "") { return Boolean(detectShareDrive(url)); }
+function isAllowedPanUrl(url = "") { return ALLOWED_DRIVES.has(detectShareDrive(url)); }
+function isNetdiskSource(source) {
+    return /(网盘|下载|百度|115|光鸭|光雅|阿里|夸克|\bUC\b|迅雷|天翼|123)/i.test(source.name)
+        || (source.episodes || []).some(ep => isPanUrl(String(ep.playId).split("|||")[0]));
 }
 
 function normalizeShareUrl(url = "") {
     let value = String(url || "").trim();
     if (value.startsWith("push://")) value = value.slice("push://".length);
     if (value.startsWith("push:")) value = value.slice("push:".length);
-    return value.trim();
+    return value.replace(/&amp;/g, "&").trim();
 }
 
 function isVideoFile(file) {
@@ -954,20 +978,23 @@ function getFileName(file) {
     return file?.file_name || file?.name || "";
 }
 
-async function getAllVideoFiles(shareURL, files) {
+async function getAllVideoFiles(shareURL, files, visited = new Set(["0"]), seenFiles = new Set()) {
     const result = [];
     for (const file of files || []) {
-        if (file?.file && isVideoFile(file)) {
+        if (!file?.dir && isVideoFile(file) && getFileId(file)) {
+            if (seenFiles.has(getFileId(file))) continue;
+            seenFiles.add(getFileId(file));
             result.push(file);
             continue;
         }
         if (file?.dir) {
             try {
                 const subFileId = getFileId(file);
-                if (!subFileId) continue;
+                if (!subFileId || visited.has(subFileId)) continue;
+                visited.add(subFileId);
                 const subFileList = await OmniBox.getDriveFileList(shareURL, subFileId);
                 if (Array.isArray(subFileList?.files)) {
-                    const subVideos = await getAllVideoFiles(shareURL, subFileList.files);
+                    const subVideos = await getAllVideoFiles(shareURL, subFileList.files, visited, seenFiles);
                     result.push(...subVideos);
                 }
             } catch (error) {
@@ -979,12 +1006,13 @@ async function getAllVideoFiles(shareURL, files) {
 }
 
 async function loadPanFiles(shareURL) {
-    if (!shareURL) return null;
+    if (!isAllowedPanUrl(shareURL) || isPrefetch()) return null;
     if (panShareCache.has(shareURL)) return panShareCache.get(shareURL);
     const cacheKey = buildCacheKey("libvio:pan-share", shareURL);
     try {
         const result = await getCachedJson(cacheKey, PAN_SHARE_CACHE_TTL, async () => {
             const driveInfo = await OmniBox.getDriveInfoByShareURL(shareURL);
+            if (!driveInfo?.driveType || driveInfo.driveType === "others") throw new Error("宿主尚未识别此网盘驱动");
             const fileList = await OmniBox.getDriveFileList(shareURL, "0");
             const files = Array.isArray(fileList?.files) ? fileList.files : [];
             const videos = await getAllVideoFiles(shareURL, files);
@@ -1000,6 +1028,7 @@ async function loadPanFiles(shareURL) {
 
 function inferDriveTypeFromSourceName(name = "") {
     const raw = String(name || "").toLowerCase();
+    if (/光鸭|光雅|guangya/.test(raw)) return "guangya";
     if (raw.includes("百度")) return "baidu";
     if (raw.includes("天翼")) return "tianyi";
     if (raw.includes("夸克")) return "quark";
@@ -1039,7 +1068,7 @@ function expandPanSourcesWithRoutes(playSources = [], from = "web") {
     const result = [];
     for (const source of playSources) {
         const driveType = inferDriveTypeFromSourceName(source?.name || "");
-        const shouldExpandRoutes = DRIVE_TYPE_CONFIG.length === 0 || !driveType || DRIVE_TYPE_CONFIG.includes(driveType);
+        const shouldExpandRoutes = ALLOWED_DRIVES.has(driveType) && DRIVE_TYPE_CONFIG.includes(driveType);
 
         if (!shouldExpandRoutes) {
             result.push(source);
@@ -1217,42 +1246,55 @@ async function detail(params, context) {
         const allCollectSources = extractPlaylistSources(html, videoId, name);
 
         // 普通采集与网盘入口分开：每个分享入口最多请求一次，失败不影响其它线路。
-        const collectSources = allCollectSources.filter(source => !/(网盘|下载)/u.test(source.name));
+        const collectSources = allCollectSources.filter(source => !isNetdiskSource(source));
         const panelSources = splitNetdiskPanels(html).map(panel => ({
             name: stripTags(panel.match(/<h3[^>]*>([\s\S]*?)<\/h3>/)?.[1] || "网盘"),
             episodes: [...panel.matchAll(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)].map(item => ({ name: stripTags(item[2]), playId: fixUrl(item[1]) }))
         }));
-        const panInputs = [...panelSources, ...allCollectSources.filter(source => /(网盘|下载)/u.test(source.name))];
+        const panInputs = [...panelSources, ...allCollectSources.filter(isNetdiskSource)];
         const processedHrefs = new Set();
         const jobs = [];
         for (const source of panInputs) for (const ep of source.episodes || []) {
             const href = fixUrl(String(ep.playId || "").split("|||")[0]);
-            if (!isCollectPlayHref(href) || processedHrefs.has(href)) continue;
+            const namedDrive = inferDriveTypeFromSourceName(normalizePanSourceName(source.name));
+            // 标题明确为其它网盘时直接排除，不请求播放页、不调用网盘 SDK。
+            if (["uc", "quark", "tianyi", "xunlei", "123pan"].includes(namedDrive)) continue;
+            if ((!isCollectPlayHref(href) && !isAllowedPanUrl(href)) || processedHrefs.has(href)) continue;
             processedHrefs.add(href);
             jobs.push({ sourceName: normalizePanSourceName(source.name), href });
         }
         const netdiskSources = [];
+        const resolvedShares = new Set();
         // 预取只读取普通线路，避免触发网盘授权、文件展开和刮削副作用。
         if (!context?.prefetch) for (let offset = 0; offset < jobs.length; offset += 3) {
             const results = await Promise.all(jobs.slice(offset, offset + 3).map(async ({ sourceName, href }) => {
                 logInfo("detail 开始处理网盘线路", { sourceName, href });
                 try {
-                    const page = await fetchHtml(href, { ttl: DETAIL_CACHE_TTL, timeout: 6000, failover: false });
-                    const json = page.match(/player_aaaa\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/)?.[1];
-                    let shareUrl = "";
-                    if (json) {
-                        const player = JSON.parse(json);
-                        const decoded = normalizeShareUrl(decodePlayerUrl(player.url, player.encrypt));
-                        if (isPanUrl(decoded)) shareUrl = decoded;
+                    let shareUrl = isAllowedPanUrl(href) ? normalizeShareUrl(href) : "";
+                    if (!shareUrl) {
+                        const page = await fetchHtml(href, { ttl: DETAIL_CACHE_TTL, timeout: 6000, failover: false });
+                        const json = page.match(/player_aaaa\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/)?.[1];
+                        if (json) {
+                            const player = JSON.parse(json);
+                            const decoded = normalizeShareUrl(decodePlayerUrl(player.url, player.encrypt));
+                            if (isAllowedPanUrl(decoded)) shareUrl = decoded;
+                        }
+                        if (!shareUrl) {
+                            const candidates = page.replace(/\\\//g, "/").match(/https?:\/\/[^\s"'<>]+/g) || [];
+                            shareUrl = candidates.map(normalizeShareUrl).find(isAllowedPanUrl) || "";
+                        }
                     }
-                    if (!shareUrl) shareUrl = page.replace(/\\\//g, "/").match(/https?:\/\/(?:drive\.uc\.cn|pan\.quark\.cn|pan\.baidu\.com|www\.alipan\.com|www\.aliyundrive\.com)\/s\/[^\s"'<>]+/i)?.[0] || "";
-                    if (!shareUrl) { logInfo("detail 网盘未取得分享链接，排除占位", { sourceName, href }); return null; }
+                    if (!isAllowedPanUrl(shareUrl)) { logInfo("detail 无百度/115/光鸭/阿里分享，排除占位", { sourceName, href }); return null; }
+                    if (resolvedShares.has(shareUrl)) return null;
+                    resolvedShares.add(shareUrl);
+                    // 按真实分享域名命名，避免标题错误时把其它盘误展示出来。
+                    sourceName = DRIVE_NAMES[detectShareDrive(shareUrl)];
                     const panInfo = await loadPanFiles(shareUrl);
                     const videos = Array.isArray(panInfo?.videos) ? panInfo.videos : [];
                     const episodes = videos.filter(file => getFileId(file) && getFileName(file)).map(file => {
                         const fileId = getFileId(file), fileName = getFileName(file);
                         return { name: fileName, playId: buildPanEpisodePlayId(shareUrl, fileId, {
-                            mode: "pan-file", shareUrl, fileId, flag: sourceName, name: fileName, vodName: name, vodId: videoId,
+                            mode: "pan-file", shareUrl, fileId, fid: `${shareUrl}|${fileId}`, sid: videoId, flag: sourceName, name: fileName, vodName: name, vodId: videoId,
                         }) };
                     });
                     logInfo("detail 网盘展开结果", { sourceName, href, videoCount: episodes.length });
@@ -1547,6 +1589,11 @@ async function play(params, context) {
         const { main: rawPlayId, meta } = decodeCombinedPlayId(playId);
         let playPageUrl = resolveCollectPlayPageUrl(rawPlayId, meta);
         const playFlag = String(meta.flag || flag || "LIBVIO");
+        if (["uc", "quark", "tianyi", "xunlei", "123pan"].includes(inferDriveTypeFromSourceName(playFlag))) return emptyPlay(playFlag);
+        if (meta.mode !== "pan-file" && isPanUrl(meta.url || rawPlayId)) {
+            const shareUrl = normalizeShareUrl(meta.url || rawPlayId);
+            return isAllowedPanUrl(shareUrl) ? { parse: 0, urls: [{ name: "网盘资源", url: `push://${shareUrl}` }] } : emptyPlay(playFlag);
+        }
         if (!playPageUrl) {
             logInfo("play 无法解析播放页地址", { rawPlayId, flag: playFlag, meta });
             return emptyPlay(playFlag);
@@ -1554,6 +1601,7 @@ async function play(params, context) {
 
         if (meta.mode === "pan-file") {
             const shareURL = normalizeShareUrl(meta.shareUrl || "");
+            if (!isAllowedPanUrl(shareURL)) return emptyPlay(playFlag);
             const fileId = String(meta.fileId || "");
             const routeType = String(meta.routeType || "").trim() || (context?.from === "web" ? "服务端代理" : "直连");
             if (shareURL && fileId) {
@@ -1602,9 +1650,9 @@ async function play(params, context) {
                     return result;
                 })();
                 const [playInfoResult, metadataResult] = await Promise.allSettled([playInfoPromise, metadataPromise]);
-                if (playInfoResult.status === "fulfilled") {
+                if (playInfoResult.status === "fulfilled" && playInfoResult.value?.url && (!Array.isArray(playInfoResult.value.url) || playInfoResult.value.url.some(item => item?.url))) {
                     const playInfo = playInfoResult.value || {};
-                    const urlList = Array.isArray(playInfo?.url) ? playInfo.url : [];
+                    const urlList = Array.isArray(playInfo?.url) ? playInfo.url.filter(item => item?.url) : (typeof playInfo?.url === "string" && playInfo.url ? [{ url: playInfo.url }] : []);
                     const metadataValue = metadataResult.status === "fulfilled" ? metadataResult.value : {};
                     const danmakuList = metadataValue?.danmakuList?.length ? metadataValue.danmakuList : (playInfo?.danmaku || []);
                     return {
@@ -1613,7 +1661,7 @@ async function play(params, context) {
                         parse: 0,
                         danmaku: danmakuList};
                 }
-                logInfo("play 网盘直取失败", { shareURL, fileId, routeType, error: playInfoResult.reason?.message || String(playInfoResult.reason || "") });
+                logInfo("play 网盘直取失败", { shareURL, fileId, routeType, error: playInfoResult.reason?.message || "网盘未返回可播放地址" });
                 return {
                     parse: 0,
                     urls: [{ name: meta.name || "网盘资源", url: `push://${shareURL}` }]
@@ -1646,6 +1694,9 @@ async function play(params, context) {
 
                 const player = JSON.parse(playerJson);
                 const realUrl = Number(player.encrypt) > 2 ? "" : buildPlayUrl(decodePlayerUrl(player.url, player.encrypt));
+                if (isPanUrl(realUrl)) return isAllowedPanUrl(realUrl)
+                    ? { parse: 0, urls: [{ name: meta.name || "网盘资源", url: `push://${realUrl}` }] }
+                    : emptyPlay(playFlag);
                 if (realUrl && isDirectMediaUrl(realUrl)) {
                     logInfo("play 直链完成", { playPageUrl, from: player.from, finalUrl: realUrl });
                     return {
