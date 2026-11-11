@@ -1,8 +1,8 @@
 // @name 网盘九站聚合
 // @author @Tao_XG
-// @description 聚合玩偶、木偶、蜡笔、闪电、多多、欧哥、花卷、虎斑、小斑；24 个主备入口，同名搜索合并，仅保留115/阿里/百度/光鸭资源，支持网盘展开、刮削、弹幕和播放
+// @description 聚合玩偶、木偶、蜡笔、闪电、多多、欧哥、花卷、虎斑、小斑；24 个主备入口，按115/阿里/百度/光鸭展示去重分享链接，一个链接一条结果，支持网盘展开、刮削、弹幕和播放
 // @dependencies axios,cheerio
-// @version 1.2.4
+// @version 1.3.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/网盘/网盘九站聚合.js
 // 基于 tardlk/OmniBox-Spider 的玩偶聚合-非分组 v1.0.1。
 
@@ -89,8 +89,11 @@ const REQUEST_TIMEOUT = 15000;
 
 
 // ==================== 搜索合并模式 ====================
-// 搜索时只抓取各站剧名并合并去重（不解析网盘），点击剧名后在详情页才解析并展示各网盘来源。
-const MERGE_PREFIX = "__merge__";
+// 搜索读取各站详情中的分享链接，按网盘类型去重直出；点击单条分享后才展开网盘文件。
+// MERGE_PREFIX/旧合并处理仅用于兼容旧搜索结果与收藏。
+const MERGE_PREFIX = "__merge__"; // 兼容旧搜索结果/收藏
+const SHARE_PREFIX = "__share__";
+const DRIVE_NAMES = { a115: "115", ali: "阿里", baidu: "百度", guangya: "光鸭" };
 // 单次搜索整体耗时预算（毫秒），默认 6 秒，避免 app 超时
 const SEARCH_TIMEOUT_BUDGET_MS = Number(process.env.SEARCH_TIMEOUT_BUDGET_MS || 6000);
 // 单次详情整体耗时预算（毫秒），默认 25 秒，避免 app 超时
@@ -1203,6 +1206,125 @@ async function filterSearchResultsByDrive(list) {
   return filtered;
 }
 
+function canonicalShareUrl(raw) {
+  try {
+    const url = new URL(normalizeShareUrl(raw));
+    const drive = detectDriveKey(url.href);
+    if (!ALLOWED_DRIVE_KEYS.has(drive)) return "";
+    url.protocol = "https:";
+    url.hostname = { a115: "115.com", ali: "www.alipan.com", baidu: "pan.baidu.com", guangya: "www.guangyapan.com" }[drive];
+    if (drive === "baidu" && /\/share\/init/.test(url.pathname) && url.searchParams.get("surl")) {
+      const token = url.searchParams.get("surl");
+      url.pathname = `/s/${token.length === 23 && token.startsWith("1") ? token : `1${token}`}`;
+      url.searchParams.delete("surl");
+    }
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    for (const key of [...url.searchParams.keys()]) {
+      if (/^(?:utm_|spm$|from$|source$|dn$|displayname$|filename$|title$)/i.test(key)) url.searchParams.delete(key);
+    }
+    url.hash = "";
+    url.searchParams.sort();
+    return isAllowedShareUrl(url.href) ? url.href : "";
+  } catch (_) { return ""; }
+}
+
+function shareIdentity(raw) {
+  const normalized = canonicalShareUrl(raw);
+  if (!normalized) return "";
+  const url = new URL(normalized);
+  // 提取码不改变分享身份；展示链接仍保留提取码。
+  for (const key of ["pwd", "password", "pass_code", "access_code", "code"]) url.searchParams.delete(key);
+  return buildCacheKey("share", url.href);
+}
+
+function decodeShareId(vodId) {
+  if (!String(vodId || "").startsWith(SHARE_PREFIX)) return null;
+  try {
+    const data = JSON.parse(b64UrlDecode(String(vodId).slice(SHARE_PREFIX.length)));
+    const url = canonicalShareUrl(data.u);
+    if (!url) return null;
+    return { u: url, t: String(data.t || ""), p: normalizeCoverUrl(data.p), y: String(data.y || ""), s: Array.isArray(data.s) ? data.s.map(String) : [] };
+  } catch (_) { return null; }
+}
+
+async function buildShareSearchResults(resultsArrays, seenShares = new Set()) {
+  const cards = [];
+  const seenCards = new Set();
+  for (const list of resultsArrays) {
+    for (const card of list) {
+      const key = `${card._site_id}|${card._href}`;
+      if (!card._site_id || !card._href || seenCards.has(key)) continue;
+      seenCards.add(key);
+      cards.push(card);
+    }
+  }
+  const budget = Number.isFinite(SEARCH_TIMEOUT_BUDGET_MS) && SEARCH_TIMEOUT_BUDGET_MS > 0 ? SEARCH_TIMEOUT_BUDGET_MS : 6000;
+  const deadline = Date.now() + budget;
+  let failed = 0;
+  const batches = await runWithConcurrency(cards, 4, async (card) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) { failed++; return []; }
+    const site = SITES.find((entry) => entry.id === card._site_id);
+    if (!site) return [];
+    try {
+      const data = await fetchSiteDetail(site, card._href, { budgetMs: remaining });
+      return data.panUrls.filter(isAllowedShareUrl).map((url) => ({
+        url, title: data.vodName || card._original_name || card.vod_name,
+        pic: data.vodPic || card.vod_pic, year: data.vodYear || card.vod_year,
+        siteName: site.name,
+      }));
+    } catch (error) {
+      failed++;
+      await OmniBox.log("warn", `[search-share] ${site.name} 详情读取失败: ${error.message}`);
+      return [];
+    }
+  });
+  const unique = new Map();
+  for (const item of batches.flat()) {
+    const url = canonicalShareUrl(item.url);
+    const key = shareIdentity(url);
+    if (!key || seenShares.has(key)) continue;
+    if (!unique.has(key)) unique.set(key, { ...item, url, sources: [] });
+    const entry = unique.get(key);
+    if (!entry.sources.includes(item.siteName)) entry.sources.push(item.siteName);
+    // 同一分享既有无提取码入口又有带码入口时，优先保留带码链接。
+    const hasCode = (u) => [...new URL(u).searchParams.keys()].some((k) => /^(pwd|password|pass_code|access_code|code)$/i.test(k) && new URL(u).searchParams.get(k));
+    if (!hasCode(entry.url) && hasCode(url)) entry.url = url;
+    if (!entry.pic && item.pic) entry.pic = item.pic;
+  }
+  const entries = [...unique.entries()].sort((a, b) => compareDriveKeyOrder(detectDriveKey(a[1].url), detectDriveKey(b[1].url)));
+  const list = entries.map(([, entry]) => {
+    const driveKey = detectDriveKey(entry.url);
+    const name = DRIVE_NAMES[driveKey];
+    const payload = { u: entry.url, t: entry.title || `${name}分享`, p: entry.pic || "", y: entry.year || "", s: entry.sources };
+    return {
+      vod_id: SHARE_PREFIX + b64UrlEncode(JSON.stringify(payload)),
+      vod_name: `[${name}] ${payload.t}`, vod_pic: payload.p,
+      vod_remarks: `${name} · ${entry.sources.join(" / ")}`, vod_year: payload.y,
+      type_id: driveKey, type_name: name, vod_tag: "video",
+    };
+  });
+  await OmniBox.log("info", `[search-share] cards=${cards.length}, shares=${batches.flat().length}, unique=${list.length}, failed=${failed}`);
+  return { list, keys: entries.map(([key]) => key), failed };
+}
+
+async function handleShareDetail(vodId) {
+  const payload = decodeShareId(vodId);
+  if (!payload) return null;
+  const driveKey = detectDriveKey(payload.u);
+  const name = DRIVE_NAMES[driveKey];
+  const metadata = { vodName: payload.t || `${name}分享`, vodPic: payload.p, vodYear: payload.y, vodContent: `${name}分享，来源：${payload.s.join(" / ")}` };
+  const result = await processDriveShareURL(payload.u);
+  if (!result) return { vod_id: vodId, vod_name: metadata.vodName, vod_pic: metadata.vodPic, vod_content: metadata.vodContent };
+  await applyUnifiedScraping([result], shareIdentity(payload.u), metadata.vodName);
+  applyScrapeMetadataToDetail(metadata, result.scrapeData);
+  return {
+    vod_id: vodId, vod_name: metadata.vodName, vod_pic: metadata.vodPic, vod_year: metadata.vodYear,
+    vod_actor: metadata.vodActor || "", vod_director: metadata.vodDirector || "", vod_content: metadata.vodContent,
+    vod_play_sources: buildEpisodesForLabel(result, name, SOURCE_NAMES_CONFIG),
+  };
+}
+
 function getSiteOrderIndex(siteId) {
   if (PAN_SITE_ORDER.length > 0) {
     const idx = PAN_SITE_ORDER.indexOf(String(siteId || "").toLowerCase());
@@ -2146,15 +2268,17 @@ async function detail(params, context) {
     const drives = context?.drives || [];
     await OmniBox.log("info", `[detail] videoId=${videoId}`);
     if (!videoId) return { list: [] };
-    const cacheKey = buildCacheKey("nine:detailResult:v124", JSON.stringify([videoId, resultCacheScope(context)]));
+    const cacheKey = buildCacheKey("nine:detailResult:v130", JSON.stringify([videoId, resultCacheScope(context)]));
     const cached = params.refresh === true ? null : await getCachedJSON(cacheKey);
     if (cached && Array.isArray(cached.list) && cached.list.some((vod) => vod?.vod_play_sources?.some((source) => source.episodes?.length))) {
       await OmniBox.log("info", `[detail-cache] 命中完整线路缓存: sources=${cached.list[0].vod_play_sources.length}, ttl=120s`);
       return cached;
     }
-    const data = String(videoId).startsWith(MERGE_PREFIX)
-      ? await handleMergedDetail(videoId, drives, context)
-      : await handleSiteDetail(videoId, drives, context);
+    const data = String(videoId).startsWith(SHARE_PREFIX)
+      ? await handleShareDetail(videoId)
+      : String(videoId).startsWith(MERGE_PREFIX)
+        ? await handleMergedDetail(videoId, drives, context)
+        : await handleSiteDetail(videoId, drives, context);
     const response = { list: data ? [data] : [] };
     if (data?.vod_play_sources?.some((source) => source.episodes?.length)) {
       await setCachedJSON(cacheKey, response, 120);
@@ -2173,8 +2297,8 @@ async function search(params, context) {
     await OmniBox.log("info", `[search] keyword=${keyword}, page=${page}`);
     if (!keyword) return { list: [], page: 1, pagecount: 0, total: 0 };
     const identity = JSON.stringify([keyword, resultCacheScope(context)]);
-    const cacheKey = buildCacheKey("nine:searchResult:v124", `${identity}:${page}`);
-    const progressKey = buildCacheKey("nine:searchPages:v123", identity);
+    const cacheKey = buildCacheKey("nine:searchResult:v130", `${identity}:${page}`);
+    const progressKey = buildCacheKey("nine:searchPages:v130", identity);
     const cached = params.refresh === true ? null : await getCachedJSON(cacheKey);
     if (cached && Array.isArray(cached.list)) {
       await OmniBox.log("info", `[search-cache] 命中搜索结果: page=${page}, count=${cached.list.length}, ttl=60s`);
@@ -2208,7 +2332,11 @@ async function search(params, context) {
       delete failedUntil[siteId];
       pageCounts[siteId] = items._pagecount;
     });
-    const allResults = await filterSearchResultsByDrive(mergeSearchResults(resultsArrays));
+    const sharePages = { ...(prior?.sharePages || {}) };
+    const seenShares = new Set(Object.entries(sharePages).filter(([number]) => Number(number) < page).flatMap(([, keys]) => Array.isArray(keys) ? keys : []));
+    const shares = await buildShareSearchResults(resultsArrays, seenShares);
+    const allResults = shares.list;
+    sharePages[page] = shares.keys;
     const knownLastPage = Math.max(1, ...Object.values(pageCounts));
     const hasUnknownSites = SITES.some((site) => !Number.isFinite(pageCounts[site.id]));
     const response = {
@@ -2218,11 +2346,11 @@ async function search(params, context) {
       total: allResults.length,
     };
     if (successCount) {
-      await setCachedJSON(progressKey, { pageCounts, failedUntil }, 60);
+      await setCachedJSON(progressKey, { pageCounts, failedUntil, sharePages }, 60);
       // 保留已经获得的结果；短暂隔离失败站，避免一次慢站拖慢所有重复查询。
       await setCachedJSON(cacheKey, response, 60);
     }
-    await OmniBox.log("info", `[search] mergedTotal=${allResults.length}, pagecount=${response.pagecount}, partial=${hasUnknownSites}`);
+    await OmniBox.log("info", `[search] uniqueShares=${allResults.length}, pagecount=${response.pagecount}, partial=${hasUnknownSites || shares.failed > 0}`);
     return response;
   } catch (error) {
     await OmniBox.log("error", `[search] ${error.message}`);
