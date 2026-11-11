@@ -1,7 +1,7 @@
 // @name 懂片帝
 // @author tardlk
-// @description 懂片帝首页、分类、搜索、分季分集及多线路播放；默认直链线路，不接入成人专区
-// @version 1.0.0
+// @description 懂片帝首页、分类、搜索、分季分集及多线路播放；含游客可用的官方4K线路，不接入成人专区
+// @version 1.0.1
 // @dependencies axios,cheerio
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/懂片帝.js
 
@@ -18,7 +18,7 @@ try { runner = require('spider_runner'); } catch (_) { runner = { run() {} }; }
 const SITE = (process.env.DONGPIAN_HOST || 'https://dongpian24.com').replace(/\/$/, '');
 const ORIGIN = new URL(SITE).origin;
 const COOKIE = String(process.env.DONGPIAN_COOKIE || '').trim();
-const TICKETS = process.env.DONGPIAN_TICKET_LINES === '1';
+const TICKETS = process.env.DONGPIAN_TICKET_LINES !== '0';
 const TIMEOUT = 15000;
 const PAGE_SIZE = 20;
 const CATEGORIES = { movie: '电影', series: '电视剧', short_drama: '短剧', anime: '动漫', variety: '综艺', documentary: '纪录片', sports: '体育' };
