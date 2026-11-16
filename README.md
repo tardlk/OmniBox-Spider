@@ -1,6 +1,6 @@
 # OmniBox-Spider
 
-仅保留以下 13 个源脚本。Gimy剧迷来自 [Silent1566/OmniBox-Spider](https://github.com/Silent1566/OmniBox-Spider)。
+仅保留以下 12 个源脚本。
 
 | 源 | 脚本 |
 | --- | --- |
@@ -11,7 +11,6 @@
 | 4kvm影院 | [采集/4kvm影院.js](采集/4kvm影院.js) |
 | Auete影视 | [采集/Auete影视.js](采集/Auete影视.js) |
 | FKTV | [采集/FKTV.js](采集/FKTV.js) |
-| Gimy剧迷 | [采集/Gimy剧迷.js](采集/Gimy剧迷.js) |
 | LIBVIO | [采集/LIBVIO.js](采集/LIBVIO.js) |
 | 影探 | [采集/影探4K.py](采集/影探4K.py) |
 | 影视大全 | [采集/影视大全.js](采集/影视大全.js) |
