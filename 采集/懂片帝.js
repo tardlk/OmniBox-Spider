@@ -1,9 +1,9 @@
 // @name 懂片帝
 // @author tardlk
 // @description 懂片帝首页、分类、搜索、分季分集及多线路播放；含游客可用的官方4K线路，不接入成人专区
-// @version 1.0.1
+// @version 1.0.2
 // @dependencies axios,cheerio
-// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/懂片帝.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/采集/懂片帝.js
 
 const axios = require('axios');
 const cheerio = require('cheerio');

@@ -7,8 +7,8 @@
 # @quickSearch 1
 # @changeable 0
 # @description 影探4K（lyyytv）：CMS 采集 + 解析接口，线路含腾讯/爱奇艺/优酷/B站/联通云/移动云；解析通道 5/6 自动择优，纯标准库 + 内置 AES，无需 pip 依赖
-# @version 1.0.0
-# @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/影探4K.py
+# @version 1.0.1
+# @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/采集/影探4K.py
 #
 # 移植自鱼壳 webhtv 版 影探4K.py：
 #   1. 协议换成 OmniBox 的 home/category/detail/search/play

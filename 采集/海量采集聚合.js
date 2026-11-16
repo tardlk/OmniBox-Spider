@@ -1,9 +1,9 @@
 // @name 海量采集聚合
 // @author tardlk
 // @description JSON/XML采集接口聚合；排除成人源，按来源浏览，并行搜索，支持缓存、刮削及弹幕
-// @version 1.0.1
+// @version 1.0.2
 // @dependencies axios,cheerio
-// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/海量采集聚合.js
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/采集/海量采集聚合.js
 
 const axios = require('axios');
 const cheerio = require('cheerio');

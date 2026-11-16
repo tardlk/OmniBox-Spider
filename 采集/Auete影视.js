@@ -2,8 +2,8 @@
 // @author 梦
 // @description 站点 www.au1080.top（Auete影视网：电影/剧集/综艺/动漫，云播 m3u8 直链）：支持首页、分类、搜索、详情与直链播放；播放页地址 base64 编码，解码即得 m3u8；站内搜索的算术验证码由脚本自动识别（Playwright 取像素 + 模板匹配），失败才回退扫列表页
 // @dependencies cheerio
-// @version 2.4.0
-// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/Auete影视.js
+// @version 2.4.1
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/采集/Auete影视.js
 
 const OmniBox = require("omnibox_sdk");
 const runner = require("spider_runner");

@@ -1,8 +1,8 @@
 // @name 影视大全
 // @author 梦
 // @description 固定入口：https://www.iysdq.me ，自动跟随站点搬迁，支持首页、分类、搜索、详情与播放解析
-// @version 1.0.3
-// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/影视大全.js
+// @version 1.0.4
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/采集/影视大全.js
 // @dependencies cheerio
 
 let OmniBox, runner;

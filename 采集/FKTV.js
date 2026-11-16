@@ -1,8 +1,8 @@
 // @name FKTV
 // @author 梦
 // @description 刮削：已接入，弹幕：未接入，播放：走站内加密接口直取 m3u8（双线路，直链播放）
-// @version 2.0.0
-// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/FKTV.js
+// @version 2.0.1
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/采集/FKTV.js
 
 const OmniBox = require("omnibox_sdk");
 const runner = require("spider_runner");

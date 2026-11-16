@@ -2,8 +2,8 @@
 // @author 梦
 // @description 刮削：已接入，弹幕：已接入，播放记录：宿主自动，嗅探：已接入（直链优先，加密线路回退网页嗅探，仅百度/115/光鸭/阿里网盘展开）
 // @dependencies
-// @version 1.6.1
-// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/影视/采集/LIBVIO.js
+// @version 1.6.2
+// @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/采集/LIBVIO.js
 
 const http = require("http");
 const https = require("https");
