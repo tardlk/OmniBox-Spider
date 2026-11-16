@@ -1,13 +1,15 @@
 // @name Gimy剧迷
 // @author 梦
 // @description 影视站：Gimy / gimy.now / gimyai.tw，支持首页、分类、详情、搜索与播放页嗅探
-// @dependencies cheerio,@types/opencc-js
-// @version 1.2.7
+// @dependencies cheerio,axios,@types/opencc-js
+// @version 1.3.0
 // @downloadURL https://gh-proxy.org/https://github.com/tardlk/OmniBox-Spider/raw/refs/heads/main/采集/Gimy剧迷.js
 
 const OmniBox = require("omnibox_sdk");
 const runner = require("spider_runner");
 const cheerio = require("cheerio");
+const axios = require("axios");
+const crypto = require("crypto");
 
 // ==================== 配置开始 ====================
 // 是否禁用 OpenCC 等外部繁简转换库；环境变量 GIMY_DISABLE_OPENCC=1 时仅使用内置兜底映射。
@@ -18,6 +20,11 @@ const PLAY_SOURCE_ORDER_CONFIG = String(process.env.GIMY_PLAY_SOURCE_ORDER || pr
 
 // 站点基础地址，用于补全相对链接和发起默认请求。
 const BASE_URL = "https://gimyai.tw";
+// SDK 的 request 选项未约定 timeout；使用可取消的 HTTP 请求设置总截止时间。
+const REQUEST_TIMEOUT_MS = 8000;
+// 复用通用配置；未配置时不调用过盾服务，也不访问页面缓存。
+const FLARESOLVERR_URL = String(process.env.FLARESOLVERR_URL || "").trim();
+const CF_MAX_TIMEOUT_MS = 18000;
 
 // 请求使用的 User-Agent，避免站点返回移动端或拦截页面。
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
@@ -39,25 +46,144 @@ function getBodyText(res) {
   return String(body || "");
 }
 
+async function requestBounded(url, options = {}) {
+  const timeout = options.timeout || REQUEST_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const res = await axios.request({
+      url,
+      method: options.method || "GET",
+      headers: options.headers || {},
+      data: options.body,
+      responseType: "text",
+      transformResponse: [(data) => data],
+      timeout,
+      signal: controller.signal,
+      maxRedirects: 3,
+      maxContentLength: 2 * 1024 * 1024,
+      validateStatus: () => true,
+    });
+    return { statusCode: Number(res.status), headers: res.headers, body: res.data };
+  } catch (error) {
+    if (controller.signal.aborted || ["ECONNABORTED", "ETIMEDOUT", "ERR_CANCELED"].includes(error.code)) {
+      throw new Error("请求超时（" + timeout + "ms）@ " + url);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isCloudflarePage(html) {
+  return /<title>\s*(?:Just a moment|Attention Required)|cf-chl-|challenge-platform|cf-browser-verification/i.test(html);
+}
+
+function cfPageCacheKey(url) {
+  return "gimy:cfpage:v1:" + crypto.createHash("sha256").update(url).digest("hex");
+}
+
+function cfPageTTL(url, method) {
+  const target = new URL(url);
+  // 播放页和解析接口不缓存，避免保存短时效播放地址。
+  if (method !== "GET" || target.origin !== BASE_URL || /^\/play\//i.test(target.pathname)) return 0;
+  return target.pathname.startsWith("/find/") ? 60 : 300;
+}
+
+async function cacheCall(action) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(action),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("缓存请求超时")), 1500); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readCfPage(url, ttl) {
+  if (!ttl) return "";
+  try {
+    const cached = await cacheCall(() => OmniBox.getCache(cfPageCacheKey(url)));
+    if (cached && typeof cached.html === "string" && cached.expiresAt > Date.now() && !isCloudflarePage(cached.html)) {
+      await OmniBox.log("info", "[Gimy剧迷][cf] 命中页面缓存: " + url + ", body长度=" + cached.html.length);
+      return cached.html;
+    }
+  } catch (error) {
+    await OmniBox.log("warn", "[Gimy剧迷][cf] 页面缓存读取失败: " + error.message);
+  }
+  return "";
+}
+
+async function solveCloudflarePage(url, options, ttl) {
+  const started = Date.now();
+  const endpoint = new URL(FLARESOLVERR_URL);
+  if (!/\/v1\/?$/.test(endpoint.pathname)) endpoint.pathname = endpoint.pathname.replace(/\/+$/, "") + "/v1";
+  const response = await requestBounded(endpoint.href, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cmd: "request.get", url, maxTimeout: CF_MAX_TIMEOUT_MS }),
+    timeout: CF_MAX_TIMEOUT_MS + 2000,
+  });
+  if (response.statusCode !== 200) throw new Error("FlareSolverr HTTP " + response.statusCode);
+  const result = JSON.parse(getBodyText(response));
+  const solution = result.solution || {};
+  const html = String(solution.response || "");
+  const cookies = Array.isArray(solution.cookies) ? solution.cookies : [];
+  const cleared = cookies.some((cookie) => cookie && cookie.name === "cf_clearance" && cookie.value);
+  await OmniBox.log("info", "[Gimy剧迷][cf] FlareSolverr status=" + result.status
+    + ", pageStatus=" + solution.status + ", cookies数量=" + cookies.length
+    + ", clearance=" + Boolean(cleared) + ", ua=" + String(solution.userAgent || "").slice(0, 80)
+    + ", body长度=" + html.length + ", 耗时=" + (Date.now() - started) + "ms");
+  if (result.status !== "ok" || Number(solution.status) !== 200 || !html || isCloudflarePage(html) || !cleared) {
+    throw new Error("FlareSolverr 未获得可用页面: " + String(result.message || result.status || "unknown"));
+  }
+  // 直接解析过盾后的 HTML，不拿 cookie 重新请求站点。
+  if (ttl && !options.prefetch && Buffer.byteLength(JSON.stringify({ html })) < 480 * 1024) {
+    try {
+      await cacheCall(() => OmniBox.setCache(cfPageCacheKey(url), { html, expiresAt: Date.now() + ttl * 1000 }, ttl));
+      await OmniBox.log("info", "[Gimy剧迷][cf] 已缓存页面: " + url + ", TTL=" + ttl + "s");
+    } catch (error) {
+      await OmniBox.log("warn", "[Gimy剧迷][cf] 页面缓存写入失败: " + error.message);
+    }
+  }
+  return html;
+}
+
 async function requestText(url, options = {}) {
-  await OmniBox.log("info", `[Gimy剧迷][request] ${options.method || "GET"} ${url}`);
-  const res = await OmniBox.request(url, {
-    method: options.method || "GET",
+  const method = options.method || "GET";
+  const ttl = FLARESOLVERR_URL ? cfPageTTL(url, method) : 0;
+  if (FLARESOLVERR_URL) {
+    const cached = await readCfPage(url, ttl);
+    if (cached) return cached;
+  }
+  await OmniBox.log("info", "[Gimy剧迷][request] " + method + " " + url + ", timeout=" + (options.timeout || REQUEST_TIMEOUT_MS) + "ms");
+  const started = Date.now();
+  const res = await requestBounded(url, {
+    method,
     headers: {
       "User-Agent": UA,
+      Accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-      Referer: options.referer || `${BASE_URL}/`,
+      Referer: options.referer || BASE_URL + "/",
       ...(options.headers || {}),
     },
     body: options.body,
-    timeout: options.timeout || 20000,
+    timeout: options.timeout,
   });
-  const statusCode = Number(res?.statusCode || 0);
-  if (!res || statusCode !== 200) {
-    throw new Error(`HTTP ${res?.statusCode || "unknown"} @ ${url}`);
+  const html = getBodyText(res);
+  await OmniBox.log("info", "[Gimy剧迷][request] HTTP " + res.statusCode + ", body长度=" + html.length + ", 耗时=" + (Date.now() - started) + "ms");
+  if (isCloudflarePage(html)) {
+    if (!FLARESOLVERR_URL || method !== "GET") {
+      throw new Error("站点返回 Cloudflare 验证页（HTTP " + res.statusCode + "），无法直接采集；需配置 FLARESOLVERR_URL 后重试");
+    }
+    return solveCloudflarePage(url, options, ttl);
   }
-  return getBodyText(res);
+  if (res.statusCode !== 200) throw new Error("HTTP " + res.statusCode + " @ " + url);
+  return html;
 }
+
 
 function absUrl(url) {
   const value = String(url || "").trim();
@@ -392,7 +518,7 @@ async function home(params, context) {
     getSimplifyConverter();
     await OmniBox.log("info", `[Gimy剧迷][display] simplifyConverter=${simplifyConverterName}`);
     const config = buildClassAndFilters();
-    const html = await requestText(`${BASE_URL}/`);
+    const html = await requestText(`${BASE_URL}/`, { prefetch: context?.prefetch === true });
     const $ = cheerio.load(html);
     const list = extractCards($).slice(0, 24);
     await OmniBox.log("info", `[Gimy剧迷][home] 推荐数: ${list.length}`);
@@ -411,7 +537,7 @@ async function category(params, context) {
     const filters = params.filters || {};
     const by = String(filters.by || "time");
     const url = `${BASE_URL}/genre/${categoryId}.html${page > 1 || by !== "time" ? `?page=${page}&by=${encodeURIComponent(by)}` : ""}`;
-    const html = await requestText(url);
+    const html = await requestText(url, { prefetch: context?.prefetch === true });
     const $ = cheerio.load(html);
     const list = extractCards($);
     await OmniBox.log("info", `[Gimy剧迷][category] type=${categoryId} page=${page} list=${list.length}`);
@@ -480,7 +606,7 @@ async function detail(params, context) {
     const videoId = String(params.videoId || params.id || params.vod_id || "").trim();
     if (!videoId) return { list: [] };
     const url = /^https?:\/\//i.test(videoId) ? videoId : absUrl(videoId);
-    const html = await requestText(url);
+    const html = await requestText(url, { prefetch: context?.prefetch === true });
     const $ = cheerio.load(html);
 
     const vod_name = toDisplayText($("h1.text-overflow, h1").first().text() || $("title").text().split("線上看")[0]);
@@ -523,7 +649,7 @@ async function search(params, context) {
     if (!keyword) return { page, pagecount: 0, total: 0, list: [] };
 
     const url = `${BASE_URL}/find/-------------.html?wd=${encodeURIComponent(keyword)}&page=${page}`;
-    const html = await requestText(url);
+    const html = await requestText(url, { prefetch: context?.prefetch === true });
     const $ = cheerio.load(html);
     const scope = $(".box-main-content").first();
     const list = extractCards($, scope);
@@ -551,7 +677,7 @@ async function play(params, context) {
 
     let playerData = null;
     try {
-      const html = await requestText(pageUrl, { referer: pageUrl });
+      const html = await requestText(pageUrl, { referer: pageUrl, prefetch: context?.prefetch === true });
       const m = html.match(/var\s+player_data\s*=\s*(\{[\s\S]*?\})\s*<\/script>/i);
       if (m) {
         await OmniBox.log("info", `[Gimy剧迷][play] player_data=${m[1].slice(0, 500)}`);
@@ -580,6 +706,7 @@ async function play(params, context) {
 
       try {
         const parseText = await requestText(parseUrl, {
+          prefetch: context?.prefetch === true,
           referer,
           headers: {
             Accept: "application/json, text/plain, */*",
